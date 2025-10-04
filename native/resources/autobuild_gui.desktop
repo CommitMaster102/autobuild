@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Autobuild
+Comment=Autobuild
+Exec=autobuild_main
+Terminal=false
+Categories=Development;
+Icon=autobuild_gui
+StartupWMClass=autobuild_main

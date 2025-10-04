@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Autobuild Animation
+Comment=OpenGL Animation System with 3D Spinning Cube
+Exec=autobuild_gui
+Terminal=false
+Categories=Development;Graphics;
+Icon=autobuild_gui
+StartupWMClass=autobuild_gui

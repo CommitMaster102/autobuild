@@ -1,0 +1,113 @@
+# Build directories
+build/
+out/
+cmake-build-*/
+
+# Compiled Object files
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Visual Studio
+*.vcxproj.user
+*.vcxproj.filters
+*.sln.docstates
+*.user
+*.aps
+*.pch
+*.vspscc
+*_i.c
+*_p.c
+*.ncb
+*.suo
+*.tlb
+*.tlh
+*.bak
+*.cache
+*.ilk
+*.log
+[Bb]in
+[Dd]ebug*/
+*.lib
+*.sbr
+obj/
+[Rr]elease*/
+_ReSharper*/
+[Tt]est[Rr]esult*
+.vs/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Package files
+*.msi
+*.dmg
+*.deb
+*.rpm
+
+# Error files
+err.txt
+out.txt
+
+# Keep important cross-platform scripts (these are part of the project)
+# *.bat, *.ps1, *.sh files are intentionally NOT ignored as they are project scripts
+
+# Files not required by CMakeLists.txt
+# These are build artifacts or temporary files not needed for the build
+autobuild_gui.json
+imgui.ini
+*.rc
+*.res
+*.tlog
+*.lastbuildstate
+*.recipe
+
+# Duplicate external directories (CMakeLists.txt uses native/external/imgui)
+native/native/
+
+# Generated resource files
+autobuild_gui_icon.rc
+autobuild_main_icon.rc
+version_gui.res
+version.res
