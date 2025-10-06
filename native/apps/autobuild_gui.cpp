@@ -997,6 +997,7 @@ static bool RunHiddenCaptureExe(const std::string &exe, const std::string &args,
 #endif
 
 // Stream variant: emits each line via callback as soon as it's available
+#ifdef _WIN32
 static bool
 RunHiddenStreamExe(const std::string &exe, const std::string &args,
                    const std::function<void(const std::string &)> &onLine,
@@ -1082,21 +1083,8 @@ RunHiddenStreamExe(const std::string &exe, const std::string &args,
   out_exit_code = 0;
   
   std::string command = exe + " " + args;
-  if (g_show_debug_console) {
-    ConsoleLog("[DEBUG][Mac/Linux] RunHiddenStreamExe command: " + command);
-  }
-  
   FILE* pipe = popen(command.c_str(), "r");
-  if (!pipe) {
-    if (g_show_debug_console) {
-      ConsoleLog("[ERROR][Mac/Linux] popen failed for: " + command);
-    }
-    return false;
-  }
-  
-  if (g_show_debug_console) {
-    ConsoleLog("[DEBUG][Mac/Linux] popen successful, reading output...");
-  }
+  if (!pipe) return false;
   
   char buffer[128];
   while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
@@ -1108,13 +1096,11 @@ RunHiddenStreamExe(const std::string &exe, const std::string &args,
   }
   
   out_exit_code = pclose(pipe);
-  if (g_show_debug_console) {
-    ConsoleLog("[DEBUG][Mac/Linux] pclose exit code: " + std::to_string(out_exit_code));
-  }
   return true;
 }
 #endif
 
+#ifdef _WIN32
 // Convert Windows path to MSYS2/Unix path format
 std::string ConvertToUnixPath(const std::string &winPath) {
   std::string unixPath = winPath;
@@ -1198,18 +1184,15 @@ static std::string ResolveDefaultLogsPath() {
   // Check if we're running from a Program Files installation (MSI)
   if (exe_dir.find("Program Files") != std::string::npos) {
     // For MSI installations, use %APPDATA%\Autobuild\logs
-    char* appdata = nullptr;
-    size_t len = 0;
-    if (_dupenv_s(&appdata, &len, "APPDATA") == 0 && appdata != nullptr) {
+    const char* appdata = getenv("APPDATA");
+    if (appdata != nullptr) {
       std::string logs_path = std::string(appdata) + "\\Autobuild\\logs";
-      free(appdata);
       return ToAbsolutePath(logs_path);
     }
     // Fallback to Documents if APPDATA fails
-    char* documents = nullptr;
-    if (_dupenv_s(&documents, &len, "USERPROFILE") == 0 && documents != nullptr) {
+    const char* documents = getenv("USERPROFILE");
+    if (documents != nullptr) {
       std::string logs_path = std::string(documents) + "\\Documents\\Autobuild\\logs";
-      free(documents);
       return ToAbsolutePath(logs_path);
     }
   }
