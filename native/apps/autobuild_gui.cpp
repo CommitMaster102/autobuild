@@ -1082,8 +1082,21 @@ RunHiddenStreamExe(const std::string &exe, const std::string &args,
   out_exit_code = 0;
   
   std::string command = exe + " " + args;
+  if (g_show_debug_console) {
+    ConsoleLog("[DEBUG][Mac/Linux] RunHiddenStreamExe command: " + command);
+  }
+  
   FILE* pipe = popen(command.c_str(), "r");
-  if (!pipe) return false;
+  if (!pipe) {
+    if (g_show_debug_console) {
+      ConsoleLog("[ERROR][Mac/Linux] popen failed for: " + command);
+    }
+    return false;
+  }
+  
+  if (g_show_debug_console) {
+    ConsoleLog("[DEBUG][Mac/Linux] popen successful, reading output...");
+  }
   
   char buffer[128];
   while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
@@ -1095,6 +1108,9 @@ RunHiddenStreamExe(const std::string &exe, const std::string &args,
   }
   
   out_exit_code = pclose(pipe);
+  if (g_show_debug_console) {
+    ConsoleLog("[DEBUG][Mac/Linux] pclose exit code: " + std::to_string(out_exit_code));
+  }
   return true;
 }
 #endif
@@ -2777,15 +2793,25 @@ static bool RunHiddenStreamExeWithHandle(
   out_exit_code = 0;
   out_process_handle = 0;
 
+  if (g_show_debug_console) {
+    ConsoleLog("[DEBUG][Mac/Linux] RunHiddenStreamExeWithHandle exe='" + exe + "' args='" + args + "'");
+  }
+
   // Create pipes for stdout/stderr
   int pipe_stdout[2], pipe_stderr[2];
   if (pipe(pipe_stdout) == -1 || pipe(pipe_stderr) == -1) {
+    if (g_show_debug_console) {
+      ConsoleLog("[ERROR][Mac/Linux] Failed to create pipes: " + std::string(strerror(errno)));
+    }
     return false;
   }
 
   // Fork the process
   pid_t pid = fork();
   if (pid == -1) {
+    if (g_show_debug_console) {
+      ConsoleLog("[ERROR][Mac/Linux] fork() failed: " + std::string(strerror(errno)));
+    }
     close(pipe_stdout[0]);
     close(pipe_stdout[1]);
     close(pipe_stderr[0]);
@@ -2828,6 +2854,10 @@ static bool RunHiddenStreamExeWithHandle(
     exit(1); // If execvp fails
   } else {
     // Parent process
+    if (g_show_debug_console) {
+      ConsoleLog("[DEBUG][Mac/Linux] Forked process PID: " + std::to_string(pid));
+    }
+    
     close(pipe_stdout[1]); // Close write end
     close(pipe_stderr[1]); // Close write end
     
@@ -2850,6 +2880,13 @@ static bool RunHiddenStreamExeWithHandle(
       int wait_result = waitpid(pid, &status, WNOHANG);
       if (wait_result == pid) {
         // Process exited
+        if (g_show_debug_console) {
+          if (WIFEXITED(status)) {
+            ConsoleLog("[DEBUG][Mac/Linux] Process " + std::to_string(pid) + " exited with code: " + std::to_string(WEXITSTATUS(status)));
+          } else if (WIFSIGNALED(status)) {
+            ConsoleLog("[DEBUG][Mac/Linux] Process " + std::to_string(pid) + " terminated by signal: " + std::to_string(WTERMSIG(status)));
+          }
+        }
         break;
       }
       
@@ -2908,7 +2945,13 @@ static bool RunHiddenStreamExeWithHandle(
     if (should_stop) {
       // Terminate the entire process tree
       // First try to kill the process group
-      killpg(pid, SIGTERM);
+      if (g_show_debug_console) {
+        ConsoleLog("[DEBUG][Mac/Linux] Sending SIGTERM to process group " + std::to_string(pid));
+      }
+      int result = killpg(pid, SIGTERM);
+      if (result != 0 && g_show_debug_console) {
+        ConsoleLog("[ERROR][Mac/Linux] killpg(SIGTERM) failed: " + std::string(strerror(errno)));
+      }
       
       // Wait a bit for graceful termination
       usleep(100000); // 100ms
@@ -2917,6 +2960,9 @@ static bool RunHiddenStreamExeWithHandle(
       int wait_result = waitpid(pid, &status, WNOHANG);
       if (wait_result == 0) {
         // Still running, force kill
+        if (g_show_debug_console) {
+          ConsoleLog("[DEBUG][Mac/Linux] Process still running, sending SIGKILL to group " + std::to_string(pid));
+        }
         killpg(pid, SIGKILL);
       }
       
@@ -2984,8 +3030,14 @@ static bool RunHiddenStreamExeWithHandle(
         // Process finished
         if (WIFEXITED(status)) {
           out_exit_code = WEXITSTATUS(status);
+          if (g_show_debug_console) {
+            ConsoleLog("[DEBUG][Mac/Linux] Process finished with exit code: " + std::to_string(out_exit_code));
+          }
         } else {
           out_exit_code = 1;
+          if (g_show_debug_console) {
+            ConsoleLog("[DEBUG][Mac/Linux] Process terminated abnormally");
+          }
         }
         break;
       }
@@ -2995,12 +3047,19 @@ static bool RunHiddenStreamExeWithHandle(
     
     if (timeout_count >= 500) {
       // Timeout - kill the process
+      if (g_show_debug_console) {
+        ConsoleLog("[DEBUG][Mac/Linux] Process timeout, sending SIGKILL to group " + std::to_string(pid));
+      }
       killpg(pid, SIGKILL);
       out_exit_code = 1;
     }
 
     close(pipe_stdout[0]);
     close(pipe_stderr[0]);
+    
+    if (g_show_debug_console) {
+      ConsoleLog("[DEBUG][Mac/Linux] Process cleanup complete for PID " + std::to_string(pid));
+    }
     return true;
   }
 }
@@ -3092,12 +3151,21 @@ void ExecuteTaskThread(std::shared_ptr<TaskInstance> task) {
     }
   }
 #else
+  if (g_show_debug_console) {
+    ConsoleLog("[DEBUG][Mac/Linux] ExecuteTaskThread command: " + task->command);
+  }
   FILE *pipe = popen(task->command.c_str(), "r");
   if (!pipe) {
+    if (g_show_debug_console) {
+      ConsoleLog("[ERROR][Mac/Linux] popen failed: " + std::string(strerror(errno)));
+    }
     std::lock_guard<std::mutex> lock(task->log_mutex);
     task->log_output.push_back("[ERROR] Failed to execute command");
     task->is_running = false;
     return;
+  }
+  if (g_show_debug_console) {
+    ConsoleLog("[DEBUG][Mac/Linux] Task started successfully");
   }
   char buffer[256];
   while (fgets(buffer, sizeof(buffer), pipe) && !task->should_stop) {
@@ -3110,20 +3178,38 @@ void ExecuteTaskThread(std::shared_ptr<TaskInstance> task) {
   {
     std::lock_guard<std::mutex> lock(task->log_mutex);
     if (task->should_stop) {
+      if (g_show_debug_console) {
+        ConsoleLog("[DEBUG][Mac/Linux] Task stopped by user");
+      }
       task->log_output.push_back("[STOPPED] Task terminated");
     } else if (ret == 0) {
+      if (g_show_debug_console) {
+        ConsoleLog("[DEBUG][Mac/Linux] Task completed successfully");
+      }
       task->log_output.push_back("[SUCCESS] Command completed successfully");
     } else {
+      if (g_show_debug_console) {
+        ConsoleLog("[ERROR][Mac/Linux] Task failed with exit code: " + std::to_string(ret));
+      }
       task->log_output.push_back("[ERROR] Command failed with exit code: " +
                                  std::to_string(ret));
     }
   }
 #endif
   task->is_running = false;
+#ifdef _WIN32
   if (task->process_handle) {
     CloseHandle(task->process_handle);
     task->process_handle = NULL;
   }
+#else
+  // On Unix, process_handle is a PID (int), no cleanup needed
+  // The process is already terminated by pclose() in the Unix branch above
+  if (g_show_debug_console && task->process_handle > 0) {
+    ConsoleLog("[DEBUG][Mac/Linux] Cleaning up process handle for PID: " + std::to_string(task->process_handle));
+  }
+  task->process_handle = 0;
+#endif
 }
 
 // Thread function to execute command asynchronously (LEGACY - kept for
@@ -3367,9 +3453,22 @@ void StopAllTasks(AppState &state) {
     if (task->is_running) {
       task->should_stop = true;
       // Terminate process immediately if we have a handle
+#ifdef _WIN32
       if (task->process_handle) {
         TerminateProcess(task->process_handle, 1);
       }
+#else
+      // On Unix, send SIGTERM to the process
+      if (task->process_handle > 0) {
+        if (g_show_debug_console) {
+          ConsoleLog("[DEBUG][Mac/Linux] Sending SIGTERM to task PID: " + std::to_string(task->process_handle));
+        }
+        int result = kill(task->process_handle, SIGTERM);
+        if (result != 0 && g_show_debug_console) {
+          ConsoleLog("[ERROR][Mac/Linux] kill() failed: " + std::string(strerror(errno)));
+        }
+      }
+#endif
     }
   }
 
@@ -3416,11 +3515,25 @@ void RemoveTask(AppState &state, int task_id) {
         task_ptr->is_running = false;
         
         // Terminate process immediately if we have a handle
+#ifdef _WIN32
         if (task_ptr->process_handle) {
           TerminateProcess(task_ptr->process_handle, 1);
           CloseHandle(task_ptr->process_handle);
           task_ptr->process_handle = NULL;
         }
+#else
+        // On Unix, send SIGTERM to the process
+        if (task_ptr->process_handle > 0) {
+          if (g_show_debug_console) {
+            ConsoleLog("[DEBUG][Mac/Linux] Deleting task, sending SIGTERM to PID: " + std::to_string(task_ptr->process_handle));
+          }
+          int result = kill(task_ptr->process_handle, SIGTERM);
+          if (result != 0 && g_show_debug_console) {
+            ConsoleLog("[ERROR][Mac/Linux] kill() failed: " + std::string(strerror(errno)));
+          }
+          task_ptr->process_handle = 0;
+        }
+#endif
         
         // Extract the data we need before creating the thread
         std::string task_name = task_ptr->name;
@@ -3895,6 +4008,9 @@ std::string BuildCommand(const AppState &state,
   }
 #else
   cmd = "bash autobuild/scripts/autobuild.sh " + args;
+  if (g_show_debug_console) {
+    ConsoleLog("[DEBUG][Mac/Linux] BuildCommand result: " + cmd);
+  }
 #endif
 
   return cmd;
