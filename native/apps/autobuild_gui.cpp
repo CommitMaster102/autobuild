@@ -5063,6 +5063,16 @@ void RenderMainUI(AppState &state) {
           state.log_folder_paths.empty()
               ? std::string()
               : state.log_folder_paths[std::max(0, state.selected_log_folder)];
+      
+      // If logs root doesn't exist but is configured, try to create it
+      if (!logs_root.empty() && !DirectoryExists(logs_root)) {
+        if (CreateDirectoryRecursive(logs_root)) {
+          if (g_show_debug_console) {
+            ConsoleLog("[DEBUG] Created logs directory: " + logs_root);
+          }
+        }
+      }
+      
       if (!logs_root.empty() && DirectoryExists(logs_root)) {
         // Left: tasks list
         ImGui::BeginChild("logs_tasks",
@@ -5185,8 +5195,27 @@ void RenderMainUI(AppState &state) {
         }
         ImGui::EndChild();
       } else {
-        ImGui::TextDisabled(
-            "Logs root not found: set a valid log folder in Settings");
+        // Show helpful message if logs directory doesn't exist
+        if (!logs_root.empty()) {
+          ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Logs directory not found:");
+          ImGui::Text("%s", logs_root.c_str());
+          ImGui::Spacing();
+          if (ImGui::Button("Create Directory")) {
+            if (CreateDirectoryRecursive(logs_root)) {
+              if (g_show_debug_console) {
+                ConsoleLog("[INFO] Created logs directory: " + logs_root);
+              }
+            } else {
+              if (g_show_debug_console) {
+                ConsoleLog("[ERROR] Failed to create logs directory: " + logs_root);
+              }
+            }
+          }
+          ImGui::SameLine();
+          ImGui::TextDisabled("Or set a different log folder in Configuration tab");
+        } else {
+          ImGui::TextDisabled("No log folder configured. Set one in Configuration tab");
+        }
       }
 
       // Confirmation modal moved to global scope (after TabBar)
