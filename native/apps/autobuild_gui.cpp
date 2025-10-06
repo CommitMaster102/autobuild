@@ -3979,13 +3979,64 @@ std::string BuildCommand(const AppState &state,
   }
   if (!workdir_unix.empty())
     args += " --workdir \\\"" + workdir_unix + "\\\"";
+  
+  // Always provide an output-dir to avoid permission issues in Program Files
+  std::string final_output_dir;
   if (!output_dir_unix.empty()) {
+    final_output_dir = output_dir_unix;
     // Make output directory unique for each task to avoid conflicts
-    std::string unique_output_dir = output_dir_unix;
     if (!unique_suffix.empty()) {
-      unique_output_dir += "_" + unique_suffix;
+      final_output_dir += "_" + unique_suffix;
     }
-    args += " --output-dir \\\"" + unique_output_dir + "\\\"";
+  } else {
+    // Use default log path configured in GUI (user-accessible location)
+    std::string default_log_root = state.log_folder_paths.empty() 
+        ? std::string() 
+        : state.log_folder_paths[std::max(0, state.selected_log_folder)];
+    
+    if (default_log_root.empty()) {
+      // Fallback: use ResolveDefaultLogsPath logic
+#ifdef _WIN32
+      std::string exe_dir = GetExecutableDir();
+      if (exe_dir.find("Program Files") != std::string::npos) {
+        // MSI install: use APPDATA
+        const char* appdata = getenv("APPDATA");
+        if (appdata != nullptr) {
+          default_log_root = std::string(appdata) + "\\Autobuild\\logs";
+        } else {
+          const char* userprofile = getenv("USERPROFILE");
+          if (userprofile != nullptr) {
+            default_log_root = std::string(userprofile) + "\\Documents\\Autobuild\\logs";
+          }
+        }
+      } else {
+        // Development: use relative to exe
+        default_log_root = exe_dir + "/../autobuild/logs";
+      }
+#elif defined(__APPLE__)
+      const char* home = getenv("HOME");
+      if (home) {
+        default_log_root = std::string(home) + "/Library/Application Support/Autobuild/logs";
+      }
+#else // Linux
+      const char* home = getenv("HOME");
+      if (home) {
+        default_log_root = std::string(home) + "/.autobuild/logs";
+      }
+#endif
+    }
+    
+    if (!default_log_root.empty()) {
+#ifdef _WIN32
+      final_output_dir = ConvertToUnixPath(default_log_root);
+#else
+      final_output_dir = default_log_root;
+#endif
+    }
+  }
+  
+  if (!final_output_dir.empty()) {
+    args += " --output-dir \\\"" + final_output_dir + "\\\"";
   }
 
 #ifdef _WIN32
