@@ -4039,63 +4039,57 @@ std::string BuildCommand(const AppState &state,
   if (!workdir_unix.empty())
     args += " --workdir \\\"" + workdir_unix + "\\\"";
   
-  // Always provide an output-dir to avoid permission issues in Program Files
-  std::string final_output_dir;
+  // Only pass --output-dir if user explicitly set one
+  // Otherwise, let the script use its default: $base_logs_dir/$task_name/$timestamp
+  // This ensures proper directory structure for the Logs Browser
   if (!output_dir_unix.empty()) {
-    final_output_dir = output_dir_unix;
+    std::string final_output_dir = output_dir_unix;
     // Make output directory unique for each task to avoid conflicts
     if (!unique_suffix.empty()) {
       final_output_dir += "_" + unique_suffix;
     }
-  } else {
-    // Use default log path configured in GUI (user-accessible location)
-    std::string default_log_root = state.log_folder_paths.empty() 
-        ? std::string() 
-        : state.log_folder_paths[std::max(0, state.selected_log_folder)];
-    
-    if (default_log_root.empty()) {
-      // Fallback: use ResolveDefaultLogsPath logic
-#ifdef _WIN32
-      std::string exe_dir = GetExecutableDir();
-      if (exe_dir.find("Program Files") != std::string::npos) {
-        // MSI install: use APPDATA
-        const char* appdata = getenv("APPDATA");
-        if (appdata != nullptr) {
-          default_log_root = std::string(appdata) + "\\Autobuild\\logs";
-        } else {
-          const char* userprofile = getenv("USERPROFILE");
-          if (userprofile != nullptr) {
-            default_log_root = std::string(userprofile) + "\\Documents\\Autobuild\\logs";
-          }
-        }
-      } else {
-        // Development: use relative to exe
-        default_log_root = exe_dir + "/../autobuild/logs";
-      }
-#elif defined(__APPLE__)
-      const char* home = getenv("HOME");
-      if (home) {
-        default_log_root = std::string(home) + "/Library/Application Support/Autobuild/logs";
-      }
-#else // Linux
-      const char* home = getenv("HOME");
-      if (home) {
-        default_log_root = std::string(home) + "/.autobuild/logs";
-      }
-#endif
-    }
-    
-    if (!default_log_root.empty()) {
-#ifdef _WIN32
-      final_output_dir = ConvertToUnixPath(default_log_root);
-#else
-      final_output_dir = default_log_root;
-#endif
-    }
+    args += " --output-dir \\\"" + final_output_dir + "\\\"";
   }
   
-  if (!final_output_dir.empty()) {
-    args += " --output-dir \\\"" + final_output_dir + "\\\"";
+  // Set AUTOBUILD_LOGS_ROOT environment variable to point script to user-accessible location
+  // This works better than --output-dir because it lets the script create the proper structure
+  std::string logs_root_for_env;
+  std::string default_log_root = state.log_folder_paths.empty() 
+      ? std::string() 
+      : state.log_folder_paths[std::max(0, state.selected_log_folder)];
+  
+  if (default_log_root.empty()) {
+    // Fallback: use ResolveDefaultLogsPath logic
+#ifdef _WIN32
+    std::string exe_dir = GetExecutableDir();
+    if (exe_dir.find("Program Files") != std::string::npos) {
+      // MSI install: use APPDATA
+      const char* appdata = getenv("APPDATA");
+      if (appdata != nullptr) {
+        logs_root_for_env = std::string(appdata) + "\\Autobuild\\logs";
+      } else {
+        const char* userprofile = getenv("USERPROFILE");
+        if (userprofile != nullptr) {
+          logs_root_for_env = std::string(userprofile) + "\\Documents\\Autobuild\\logs";
+        }
+      }
+    } else {
+      // Development: use relative to exe
+      logs_root_for_env = exe_dir + "/../autobuild/logs";
+    }
+#elif defined(__APPLE__)
+    const char* home = getenv("HOME");
+    if (home) {
+      logs_root_for_env = std::string(home) + "/Library/Application Support/Autobuild/logs";
+    }
+#else // Linux
+    const char* home = getenv("HOME");
+    if (home) {
+      logs_root_for_env = std::string(home) + "/.autobuild/logs";
+    }
+#endif
+  } else {
+    logs_root_for_env = default_log_root;
   }
 
 #ifdef _WIN32
@@ -4118,12 +4112,22 @@ std::string BuildCommand(const AppState &state,
     
     if (g_show_debug_console) {
       ConsoleLog("[DEBUG][Windows] Script path: " + script_path);
+      ConsoleLog("[DEBUG][Windows] Logs root: " + logs_root_for_env);
     }
+    
+    // Convert logs root to Unix path for bash
+    std::string logs_root_unix = ConvertToUnixPath(logs_root_for_env);
       
-    const char *head =
+    std::string head =
         "export PATH=/c/Program\\ "
         "Files/Docker/Docker/resources/bin:/mingw64/bin:/usr/bin:$PATH; export "
-        "PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8; ";
+        "PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8";
+    
+    // Add AUTOBUILD_LOGS_ROOT if we have a logs root
+    if (!logs_root_unix.empty()) {
+      head += "; export AUTOBUILD_LOGS_ROOT='" + logs_root_unix + "'";
+    }
+    head += "; ";
     // Use single quotes around the script path to handle spaces properly
     std::string quoted_script_path = "'" + script_path + "'";
     
@@ -4140,9 +4144,15 @@ std::string BuildCommand(const AppState &state,
   if (g_show_debug_console) {
     ConsoleLog("[DEBUG][Mac/Linux] Executable dir: " + exe_dir);
     ConsoleLog("[DEBUG][Mac/Linux] Script path: " + script_path);
+    ConsoleLog("[DEBUG][Mac/Linux] Logs root: " + logs_root_for_env);
   }
   
-  cmd = "bash '" + script_path + "' " + args;
+  // Set AUTOBUILD_LOGS_ROOT environment variable if we have a logs root
+  if (!logs_root_for_env.empty()) {
+    cmd = "export AUTOBUILD_LOGS_ROOT='" + logs_root_for_env + "'; bash '" + script_path + "' " + args;
+  } else {
+    cmd = "bash '" + script_path + "' " + args;
+  }
   
   if (g_show_debug_console) {
     ConsoleLog("[DEBUG][Mac/Linux] BuildCommand result: " + cmd);
