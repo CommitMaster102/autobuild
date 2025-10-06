@@ -4104,8 +4104,8 @@ std::string BuildCommand(const AppState &state,
       // Script is installed inside bin directory: bin/autobuild/scripts/autobuild.sh
       script_path = exe_dir + "/autobuild/scripts/autobuild.sh";
     } else {
-      // Development: go up from build directory to find autobuild folder
-      script_path = exe_dir + "/../autobuild/scripts/autobuild.sh";
+      // Development: go up from build directory (native/build-gui-mingw) to project root
+      script_path = exe_dir + "/../../autobuild/scripts/autobuild.sh";
     }
     
     // Convert Windows path to Unix format for bash
