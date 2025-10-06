@@ -56,8 +56,6 @@ if(SDL2_FOUND)
     elseif(APPLE)
       set_target_properties(autobuild_gui PROPERTIES MACOSX_BUNDLE TRUE)
       set_target_properties(autobuild_gui PROPERTIES MACOSX_BUNDLE_GUI_IDENTIFIER "com.autobuild.gui")
-    elseif(UNIX)
-      set_target_properties(autobuild_gui PROPERTIES LINK_FLAGS "-mwindows")
     endif()
 
     # Main GUI executable (without OpenGL)
@@ -82,8 +80,54 @@ if(SDL2_FOUND)
     elseif(APPLE)
       set_target_properties(autobuild_main PROPERTIES MACOSX_BUNDLE TRUE)
       set_target_properties(autobuild_main PROPERTIES MACOSX_BUNDLE_GUI_IDENTIFIER "com.autobuild.main")
-    elseif(UNIX)
-      set_target_properties(autobuild_main PROPERTIES LINK_FLAGS "-mwindows")
+    endif()
+
+    # Bundle dependencies with macOS app bundles for self-contained distribution
+    if(APPLE AND SDL2_FOUND)
+      # Find SDL2 library path
+      get_target_property(SDL2_LIBRARY SDL2::SDL2 LOCATION)
+      if(SDL2_LIBRARY)
+        # Copy SDL2 to app bundle Frameworks
+        add_custom_command(TARGET autobuild_gui POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E make_directory
+          "$<TARGET_BUNDLE_DIR:autobuild_gui>/Contents/Frameworks"
+          COMMAND ${CMAKE_COMMAND} -E copy
+          "${SDL2_LIBRARY}"
+          "$<TARGET_BUNDLE_DIR:autobuild_gui>/Contents/Frameworks/"
+          COMMENT "Bundling SDL2 with autobuild_gui app")
+        
+        add_custom_command(TARGET autobuild_main POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E make_directory
+          "$<TARGET_BUNDLE_DIR:autobuild_main>/Contents/Frameworks"
+          COMMAND ${CMAKE_COMMAND} -E copy
+          "${SDL2_LIBRARY}"
+          "$<TARGET_BUNDLE_DIR:autobuild_main>/Contents/Frameworks/"
+          COMMENT "Bundling SDL2 with autobuild_main app")
+        
+        # Update library paths to use bundled SDL2
+        add_custom_command(TARGET autobuild_gui POST_BUILD
+          COMMAND install_name_tool -change
+          "${SDL2_LIBRARY}"
+          "@executable_path/../Frameworks/libSDL2.dylib"
+          "$<TARGET_BUNDLE_DIR:autobuild_gui>/Contents/MacOS/autobuild_gui"
+          COMMENT "Updating SDL2 library path in autobuild_gui")
+        
+        add_custom_command(TARGET autobuild_main POST_BUILD
+          COMMAND install_name_tool -change
+          "${SDL2_LIBRARY}"
+          "@executable_path/../Frameworks/libSDL2.dylib"
+          "$<TARGET_BUNDLE_DIR:autobuild_main>/Contents/MacOS/autobuild_main"
+          COMMENT "Updating SDL2 library path in autobuild_main")
+      endif()
+      
+      # Bundle OpenGL frameworks (macOS system frameworks)
+      add_custom_command(TARGET autobuild_gui POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_BUNDLE_DIR:autobuild_gui>/Contents/Frameworks"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+        "/System/Library/Frameworks/OpenGL.framework"
+        "$<TARGET_BUNDLE_DIR:autobuild_gui>/Contents/Frameworks/OpenGL.framework"
+        COMMENT "Linking OpenGL framework for autobuild_gui")
     endif()
 
     # Copy Font Awesome fonts to build directory for main GUI
@@ -139,6 +183,20 @@ else()
 endif()
 
 enable_testing()
+
+# Cross-platform runtime linkage settings
+# - Link pthreads on all platforms that require it
+# - Link dl on Linux for dynamic loading where needed
+find_package(Threads REQUIRED)
+target_link_libraries(autobuild_main PRIVATE Threads::Threads)
+target_link_libraries(autobuild_gui PRIVATE Threads::Threads)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(autobuild_main PRIVATE dl)
+  target_link_libraries(autobuild_gui PRIVATE dl)
+  # Prefer relative RPATHs for installed binaries on Linux
+  set(CMAKE_INSTALL_RPATH "\$ORIGIN")
+  set(CMAKE_BUILD_WITH_INSTALL_RPATH OFF)
+endif()
 
 
 
@@ -253,6 +311,7 @@ install(CODE "
     endif()
   endfunction()
   _try_fix(autobuild_gui)
+  _try_fix(autobuild_main)
 ")
 
 # Install MSVC runtime DLLs into bin on Windows

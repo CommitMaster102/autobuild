@@ -261,8 +261,24 @@ int main(int argc, char* argv[]) {
         } else {
             printf("Failed to launch main application. Error: %lu\n", GetLastError());
         }
+    #elif defined(__APPLE__)
+        // On macOS prefer LaunchServices if app bundle, else exec from PATH
+        // Try to open by bundle identifier if installed
+        int rc = system("open -b com.autobuild.main >/dev/null 2>&1");
+        if (rc != 0) {
+            // Fallback: try opening by executable name from PATH
+            rc = system("open -a autobuild_main >/dev/null 2>&1");
+        }
+        if (rc != 0) {
+            // Last resort: run from current directory/background
+            rc = system("./autobuild_main &");
+        }
     #else
-        system("cd build-gui-mingw && ./autobuild_main");
+        // Linux/Unix: rely on PATH first, then local fallback
+        int rc = system("autobuild_main &");
+        if (rc != 0) {
+            system("./autobuild_main &");
+        }
     #endif
     
     return 0;

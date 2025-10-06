@@ -40,6 +40,31 @@ bool g_fonts_loaded = false;
 #include <cmath>
 #include <map>
 
+// Platform-specific includes
+#ifdef _WIN32
+#include <windows.h>
+#include <process.h>
+#include <io.h>
+#include <direct.h>
+#elif defined(__APPLE__)
+#include <unistd.h>
+#include <libproc.h>
+#include <sys/sysctl.h>
+#include <mach-o/dyld.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/types.h>
+#else
+#include <unistd.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/types.h>
+#endif
+
 // IM_ASSERT override is handled in imgui.h when IMGUI_ASSERT_OVERRIDE is
 // defined
 
@@ -160,6 +185,7 @@ AnimationManager g_animation_manager;
 #include <direct.h>
 #include <errno.h>
 #include <stdlib.h>
+#endif
 
 // Forward declaration
 static std::vector<std::string> RunShellLines(const std::string &sh);
@@ -254,7 +280,8 @@ static std::string GenerateUniqueImageName(const std::string &base_name) {
   return unique_name;
 }
 
-// Utility: UTF-16 conversion
+#ifdef _WIN32
+// Utility: UTF-16 conversion (Windows only)
 static std::wstring Widen(const std::string &narrow) {
   if (narrow.empty())
     return std::wstring();
@@ -266,12 +293,13 @@ static std::wstring Widen(const std::string &narrow) {
   return wide;
 }
 
-// Utility: check file existence (Windows)
+// Utility: check file existence (Windows only)
 static bool FileExistsWin(const std::string &path) {
   DWORD attrs = GetFileAttributesA(path.c_str());
   return (attrs != INVALID_FILE_ATTRIBUTES) &&
          !(attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
+#endif
 
 // Utility: strip ANSI escape sequences from strings
 static std::string stripAnsiCodes(const std::string &str) {
@@ -380,6 +408,8 @@ static bool SafeDeleteImage(const std::string &image_id,
 static std::string g_cached_bash_path;
 static bool g_bash_path_cached = false;
 
+#ifdef _WIN32
+// Windows version
 static std::string FindBash() {
   // Return cached result if available
   if (g_bash_path_cached) {
@@ -439,8 +469,60 @@ static std::string FindBash() {
   g_bash_path_cached = true;
   return std::string();
 }
+#else
+// macOS/Linux version
+static std::string FindBash() {
+  // Return cached result if available
+  if (g_bash_path_cached) {
+    return g_cached_bash_path;
+  }
+  
+  // Common bash locations on macOS/Linux
+  const char *candidates[] = {
+    "/bin/bash",
+    "/usr/bin/bash",
+    "/usr/local/bin/bash",
+    "/opt/homebrew/bin/bash",
+    "/usr/local/opt/bash/bin/bash"
+  };
+  
+  for (auto cand : candidates) {
+    if (access(cand, X_OK) == 0) {
+      g_cached_bash_path = std::string(cand);
+      g_bash_path_cached = true;
+      return g_cached_bash_path;
+    }
+  }
+  
+  // Try which command as fallback
+  FILE* pipe = popen("which bash", "r");
+  if (pipe) {
+    char buffer[256];
+    if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+      std::string path(buffer);
+      // Remove trailing newline
+      if (!path.empty() && path.back() == '\n') {
+        path.pop_back();
+      }
+      if (access(path.c_str(), X_OK) == 0) {
+        g_cached_bash_path = path;
+        g_bash_path_cached = true;
+        pclose(pipe);
+        return g_cached_bash_path;
+      }
+    }
+    pclose(pipe);
+  }
+  
+  // Cache empty result to avoid repeated searches
+  g_cached_bash_path = std::string();
+  g_bash_path_cached = true;
+  return std::string();
+}
+#endif
 
 // Run a command hidden (no console) and capture stdout/stderr into lines
+#ifdef _WIN32
 static bool RunHiddenCapture(const std::string &command,
                              std::vector<std::string> &out_lines,
                              DWORD &out_exit_code) {
@@ -516,8 +598,160 @@ static bool RunHiddenCapture(const std::string &command,
   CloseHandle(hRead);
   return true;
 }
+#else
+// macOS/Linux version - proper implementation
+static bool RunHiddenCapture(const std::string &command,
+                             std::vector<std::string> &out_lines,
+                             int &out_exit_code) {
+  out_lines.clear();
+  out_exit_code = 0;
+
+  // Create pipes for stdout/stderr
+  int pipe_stdout[2], pipe_stderr[2];
+  if (pipe(pipe_stdout) == -1 || pipe(pipe_stderr) == -1) {
+    return false;
+  }
+
+  // Fork the process
+  pid_t pid = fork();
+  if (pid == -1) {
+    close(pipe_stdout[0]);
+    close(pipe_stdout[1]);
+    close(pipe_stderr[0]);
+    close(pipe_stderr[1]);
+    return false;
+  }
+
+  if (pid == 0) {
+    // Child process
+    close(pipe_stdout[0]); // Close read end
+    close(pipe_stderr[0]); // Close read end
+    
+    // Redirect stdout and stderr to pipes
+    dup2(pipe_stdout[1], STDOUT_FILENO);
+    dup2(pipe_stderr[1], STDERR_FILENO);
+    close(pipe_stdout[1]);
+    close(pipe_stderr[1]);
+
+    // Execute the command using shell
+    execl("/bin/sh", "sh", "-c", command.c_str(), (char*)nullptr);
+    exit(1); // If execl fails
+  } else {
+    // Parent process
+    close(pipe_stdout[1]); // Close write end
+    close(pipe_stderr[1]); // Close write end
+
+    std::string buffer;
+    buffer.reserve(4096);
+    char chunk[512];
+    int bytes = 0;
+    int status;
+    
+    // Read from both stdout and stderr
+    while (true) {
+      // Check if process is still running
+      int wait_result = waitpid(pid, &status, WNOHANG);
+      if (wait_result == pid) {
+        // Process exited
+        break;
+      }
+      
+      // Read from stdout
+      bytes = read(pipe_stdout[0], chunk, sizeof(chunk));
+      if (bytes > 0) {
+        buffer.append(chunk, bytes);
+      }
+      
+      // Read from stderr
+      bytes = read(pipe_stderr[0], chunk, sizeof(chunk));
+      if (bytes > 0) {
+        buffer.append(chunk, bytes);
+      }
+      
+      // Process complete lines
+      size_t pos = 0;
+      size_t nl;
+      while ((nl = buffer.find_first_of("\r\n", pos)) != std::string::npos) {
+        if (nl > pos) {
+          out_lines.emplace_back(buffer.substr(pos, nl - pos));
+        }
+        size_t next = nl + 1;
+        if (next < buffer.size() &&
+            ((buffer[nl] == '\r' && buffer[next] == '\n') ||
+             (buffer[nl] == '\n' && buffer[next] == '\r')))
+          next++;
+        pos = next;
+      }
+      if (pos > 0)
+        buffer.erase(0, pos);
+        
+      // Small delay to prevent busy waiting
+      usleep(10000); // 10ms
+    }
+
+    // Read remaining output
+    while (true) {
+      bytes = read(pipe_stdout[0], chunk, sizeof(chunk));
+      if (bytes <= 0) break;
+      buffer.append(chunk, bytes);
+    }
+    
+    while (true) {
+      bytes = read(pipe_stderr[0], chunk, sizeof(chunk));
+      if (bytes <= 0) break;
+      buffer.append(chunk, bytes);
+    }
+    
+    // Process any remaining lines
+    size_t pos = 0;
+    size_t nl;
+    while ((nl = buffer.find_first_of("\r\n", pos)) != std::string::npos) {
+      if (nl > pos) {
+        out_lines.emplace_back(buffer.substr(pos, nl - pos));
+      }
+      size_t next = nl + 1;
+      if (next < buffer.size() &&
+          ((buffer[nl] == '\r' && buffer[next] == '\n') ||
+           (buffer[nl] == '\n' && buffer[next] == '\r')))
+        next++;
+      pos = next;
+    }
+    if (pos < buffer.size()) {
+      out_lines.emplace_back(buffer.substr(pos));
+    }
+
+    // Wait for process with timeout
+    int timeout_count = 0;
+    while (timeout_count < 500) { // 5 second timeout (500 * 10ms)
+      int wait_result = waitpid(pid, &status, WNOHANG);
+      if (wait_result == pid) {
+        // Process finished
+        if (WIFEXITED(status)) {
+          out_exit_code = WEXITSTATUS(status);
+        } else {
+          out_exit_code = 1;
+        }
+        break;
+      }
+      usleep(10000); // 10ms
+      timeout_count++;
+    }
+    
+    if (timeout_count >= 500) {
+      // Timeout - kill the process
+      kill(pid, SIGKILL);
+      out_exit_code = 1;
+    }
+
+    close(pipe_stdout[0]);
+    close(pipe_stderr[0]);
+    return true;
+  }
+}
+#endif
 
 // Run specific executable with args hidden; avoids cmd.exe quoting pitfalls
+#ifdef _WIN32
 static bool RunHiddenCaptureExe(const std::string &exe, const std::string &args,
                                 std::vector<std::string> &out_lines,
                                 DWORD &out_exit_code) {
@@ -594,6 +828,173 @@ static bool RunHiddenCaptureExe(const std::string &exe, const std::string &args,
   CloseHandle(hRead);
   return true;
 }
+#else
+// macOS/Linux version - proper implementation
+static bool RunHiddenCaptureExe(const std::string &exe, const std::string &args,
+                                std::vector<std::string> &out_lines,
+                                int &out_exit_code) {
+  out_lines.clear();
+  out_exit_code = 0;
+
+  // Create pipes for stdout/stderr
+  int pipe_stdout[2], pipe_stderr[2];
+  if (pipe(pipe_stdout) == -1 || pipe(pipe_stderr) == -1) {
+    return false;
+  }
+
+  // Fork the process
+  pid_t pid = fork();
+  if (pid == -1) {
+    close(pipe_stdout[0]);
+    close(pipe_stdout[1]);
+    close(pipe_stderr[0]);
+    close(pipe_stderr[1]);
+    return false;
+  }
+
+  if (pid == 0) {
+    // Child process
+    close(pipe_stdout[0]); // Close read end
+    close(pipe_stderr[0]); // Close read end
+    
+    // Redirect stdout and stderr to pipes
+    dup2(pipe_stdout[1], STDOUT_FILENO);
+    dup2(pipe_stderr[1], STDERR_FILENO);
+    close(pipe_stdout[1]);
+    close(pipe_stderr[1]);
+
+    // Build command array
+    std::string full_command = exe + " " + args;
+    std::vector<std::string> tokens;
+    std::stringstream ss(full_command);
+    std::string token;
+    while (ss >> token) {
+      tokens.push_back(token);
+    }
+    
+    // Convert to char* array
+    std::vector<char*> argv;
+    for (auto& t : tokens) {
+      argv.push_back(const_cast<char*>(t.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    // Execute the command
+    execvp(exe.c_str(), argv.data());
+    exit(1); // If execvp fails
+  } else {
+    // Parent process
+    close(pipe_stdout[1]); // Close write end
+    close(pipe_stderr[1]); // Close write end
+
+    std::string buffer;
+    buffer.reserve(4096);
+    char chunk[512];
+    int bytes = 0;
+    int status;
+    
+    // Read from both stdout and stderr
+    while (true) {
+      // Check if process is still running
+      int wait_result = waitpid(pid, &status, WNOHANG);
+      if (wait_result == pid) {
+        // Process exited
+        break;
+      }
+      
+      // Read from stdout
+      bytes = read(pipe_stdout[0], chunk, sizeof(chunk));
+      if (bytes > 0) {
+        buffer.append(chunk, bytes);
+      }
+      
+      // Read from stderr
+      bytes = read(pipe_stderr[0], chunk, sizeof(chunk));
+      if (bytes > 0) {
+        buffer.append(chunk, bytes);
+      }
+      
+      // Process complete lines
+      size_t pos = 0;
+      size_t nl;
+      while ((nl = buffer.find_first_of("\r\n", pos)) != std::string::npos) {
+        if (nl > pos) {
+          out_lines.emplace_back(buffer.substr(pos, nl - pos));
+        }
+        size_t next = nl + 1;
+        if (next < buffer.size() &&
+            ((buffer[nl] == '\r' && buffer[next] == '\n') ||
+             (buffer[nl] == '\n' && buffer[next] == '\r')))
+          next++;
+        pos = next;
+      }
+      if (pos > 0)
+        buffer.erase(0, pos);
+        
+      // Small delay to prevent busy waiting
+      usleep(10000); // 10ms
+    }
+
+    // Read remaining output
+    while (true) {
+      bytes = read(pipe_stdout[0], chunk, sizeof(chunk));
+      if (bytes <= 0) break;
+      buffer.append(chunk, bytes);
+    }
+    
+    while (true) {
+      bytes = read(pipe_stderr[0], chunk, sizeof(chunk));
+      if (bytes <= 0) break;
+      buffer.append(chunk, bytes);
+    }
+    
+    // Process any remaining lines
+    size_t pos = 0;
+    size_t nl;
+    while ((nl = buffer.find_first_of("\r\n", pos)) != std::string::npos) {
+      if (nl > pos) {
+        out_lines.emplace_back(buffer.substr(pos, nl - pos));
+      }
+      size_t next = nl + 1;
+      if (next < buffer.size() &&
+          ((buffer[nl] == '\r' && buffer[next] == '\n') ||
+           (buffer[nl] == '\n' && buffer[next] == '\r')))
+        next++;
+      pos = next;
+    }
+    if (pos < buffer.size()) {
+      out_lines.emplace_back(buffer.substr(pos));
+    }
+
+    // Wait for process with timeout
+    int timeout_count = 0;
+    while (timeout_count < 500) { // 5 second timeout (500 * 10ms)
+      int wait_result = waitpid(pid, &status, WNOHANG);
+      if (wait_result == pid) {
+        // Process finished
+        if (WIFEXITED(status)) {
+          out_exit_code = WEXITSTATUS(status);
+        } else {
+          out_exit_code = 1;
+        }
+        break;
+      }
+      usleep(10000); // 10ms
+      timeout_count++;
+    }
+    
+    if (timeout_count >= 500) {
+      // Timeout - kill the process
+      kill(pid, SIGKILL);
+      out_exit_code = 1;
+    }
+
+    close(pipe_stdout[0]);
+    close(pipe_stderr[0]);
+    return true;
+  }
+}
+#endif
 
 // Stream variant: emits each line via callback as soon as it's available
 static bool
@@ -672,6 +1073,31 @@ RunHiddenStreamExe(const std::string &exe, const std::string &args,
   CloseHandle(hRead);
   return true;
 }
+#else
+// macOS/Linux version
+static bool
+RunHiddenStreamExe(const std::string &exe, const std::string &args,
+                   const std::function<void(const std::string &)> &onLine,
+                   int &out_exit_code) {
+  out_exit_code = 0;
+  
+  std::string command = exe + " " + args;
+  FILE* pipe = popen(command.c_str(), "r");
+  if (!pipe) return false;
+  
+  char buffer[128];
+  while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+    std::string line(buffer);
+    if (!line.empty() && line.back() == '\n') {
+      line.pop_back();
+    }
+    onLine(line);
+  }
+  
+  out_exit_code = pclose(pipe);
+  return true;
+}
+#endif
 
 // Convert Windows path to MSYS2/Unix path format
 std::string ConvertToUnixPath(const std::string &winPath) {
@@ -704,6 +1130,15 @@ static std::string GetExecutableDir() {
   std::string p(path, len);
   size_t pos = p.find_last_of("\\/");
   return (pos != std::string::npos) ? p.substr(0, pos) : std::string(".");
+#elif defined(__APPLE__)
+  char path[1024];
+  uint32_t size = sizeof(path);
+  if (_NSGetExecutablePath(path, &size) == 0) {
+    std::string p(path);
+    size_t pos = p.find_last_of('/');
+    return (pos != std::string::npos) ? p.substr(0, pos) : std::string(".");
+  }
+  return ".";
 #else
   char buf[4096];
   ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -725,8 +1160,14 @@ static std::string ToAbsolutePath(const std::string &path) {
     return std::string(full);
   return path;
 #else
-  // Best-effort: return as-is if realpath fails (e.g., when path doesn't exist
-  // yet)
+  // Use realpath for absolute path resolution
+  char* resolved = realpath(path.c_str(), nullptr);
+  if (resolved) {
+    std::string result(resolved);
+    free(resolved);
+    return result;
+  }
+  // If realpath fails (e.g., path doesn't exist yet), return as-is
   return path;
 #endif
 }
@@ -830,7 +1271,11 @@ struct TaskInstance {
   std::atomic<bool> should_stop{false};
   std::atomic<bool> container_created{
       false};                   // Track if Docker container has been created
+#ifdef _WIN32
   HANDLE process_handle = NULL; // Windows process handle for termination
+#else
+  int process_handle = 0; // Unix process handle for termination
+#endif
   std::string log_search_filter;
 
   TaskInstance(int task_id, const std::string &task_name,
@@ -1025,6 +1470,7 @@ extern "C" void abort() {
 #endif
 
 // Custom assertion handler for C runtime
+#ifdef _WIN32
 static int CustomCrtAssertHandler(int reportType, char *message,
                                   int *returnValue) {
   if (reportType == _CRT_ASSERT) {
@@ -1038,6 +1484,7 @@ static int CustomCrtAssertHandler(int reportType, char *message,
   }
   return 0; // Use default handler for other types
 }
+#endif
 
 // Signal handler for assertion failures
 static void AssertionSignalHandler(int sig) {
@@ -2176,6 +2623,7 @@ void SetModernStyle() {
 }
 
 // NEW: Enhanced streaming with process handle capture for termination
+#ifdef _WIN32
 static bool RunHiddenStreamExeWithHandle(
     const std::string &exe, const std::string &args,
     const std::function<void(const std::string &)> &onLine,
@@ -2319,6 +2767,244 @@ static bool RunHiddenStreamExeWithHandle(
   CloseHandle(hRead);
   return true;
 }
+#else
+// macOS/Linux version
+static bool RunHiddenStreamExeWithHandle(
+    const std::string &exe, const std::string &args,
+    const std::function<void(const std::string &)> &onLine,
+    int &out_exit_code, int &out_process_handle,
+    std::atomic<bool> &should_stop) {
+  out_exit_code = 0;
+  out_process_handle = 0;
+
+  // Create pipes for stdout/stderr
+  int pipe_stdout[2], pipe_stderr[2];
+  if (pipe(pipe_stdout) == -1 || pipe(pipe_stderr) == -1) {
+    return false;
+  }
+
+  // Fork the process
+  pid_t pid = fork();
+  if (pid == -1) {
+    close(pipe_stdout[0]);
+    close(pipe_stdout[1]);
+    close(pipe_stderr[0]);
+    close(pipe_stderr[1]);
+    return false;
+  }
+
+  if (pid == 0) {
+    // Child process
+    close(pipe_stdout[0]); // Close read end
+    close(pipe_stderr[0]); // Close read end
+    
+    // Create new process group for proper termination
+    setpgid(0, 0);
+    
+    // Redirect stdout and stderr to pipes
+    dup2(pipe_stdout[1], STDOUT_FILENO);
+    dup2(pipe_stderr[1], STDERR_FILENO);
+    close(pipe_stdout[1]);
+    close(pipe_stderr[1]);
+
+    // Build command array
+    std::string full_command = exe + " " + args;
+    std::vector<std::string> tokens;
+    std::stringstream ss(full_command);
+    std::string token;
+    while (ss >> token) {
+      tokens.push_back(token);
+    }
+    
+    // Convert to char* array
+    std::vector<char*> argv;
+    for (auto& t : tokens) {
+      argv.push_back(const_cast<char*>(t.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    // Execute the command
+    execvp(exe.c_str(), argv.data());
+    exit(1); // If execvp fails
+  } else {
+    // Parent process
+    close(pipe_stdout[1]); // Close write end
+    close(pipe_stderr[1]); // Close write end
+    
+    out_process_handle = pid;
+
+    // Set pipes to non-blocking
+    int flags = fcntl(pipe_stdout[0], F_GETFL, 0);
+    fcntl(pipe_stdout[0], F_SETFL, flags | O_NONBLOCK);
+    flags = fcntl(pipe_stderr[0], F_GETFL, 0);
+    fcntl(pipe_stderr[0], F_SETFL, flags | O_NONBLOCK);
+
+    std::string buffer;
+    buffer.reserve(4096);
+    char chunk[512];
+    int bytes = 0;
+    int status;
+    
+    while (!should_stop) {
+      // Check if process is still running
+      int wait_result = waitpid(pid, &status, WNOHANG);
+      if (wait_result == pid) {
+        // Process exited
+        break;
+      }
+      
+      // Read from stdout
+      bytes = read(pipe_stdout[0], chunk, sizeof(chunk));
+      if (bytes > 0) {
+        buffer.append(chunk, bytes);
+        size_t pos = 0;
+        size_t nl;
+        while ((nl = buffer.find_first_of("\r\n", pos)) != std::string::npos) {
+          if (nl > pos) {
+            std::string line = buffer.substr(pos, nl - pos);
+            // Strip ANSI escape sequences
+            line = stripAnsiCodes(line);
+            onLine(line);
+          }
+          size_t next = nl + 1;
+          if (next < buffer.size() &&
+              ((buffer[nl] == '\r' && buffer[next] == '\n') ||
+               (buffer[nl] == '\n' && buffer[next] == '\r')))
+            next++;
+          pos = next;
+        }
+        if (pos > 0)
+          buffer.erase(0, pos);
+      }
+      
+      // Read from stderr
+      bytes = read(pipe_stderr[0], chunk, sizeof(chunk));
+      if (bytes > 0) {
+        buffer.append(chunk, bytes);
+        size_t pos = 0;
+        size_t nl;
+        while ((nl = buffer.find_first_of("\r\n", pos)) != std::string::npos) {
+          if (nl > pos) {
+            std::string line = buffer.substr(pos, nl - pos);
+            // Strip ANSI escape sequences
+            line = stripAnsiCodes(line);
+            onLine(line);
+          }
+          size_t next = nl + 1;
+          if (next < buffer.size() &&
+              ((buffer[nl] == '\r' && buffer[next] == '\n') ||
+               (buffer[nl] == '\n' && buffer[next] == '\r')))
+            next++;
+          pos = next;
+        }
+        if (pos > 0)
+          buffer.erase(0, pos);
+      }
+      
+      // Small delay to prevent busy waiting
+      usleep(10000); // 10ms
+    }
+
+    if (should_stop) {
+      // Terminate the entire process tree
+      // First try to kill the process group
+      killpg(pid, SIGTERM);
+      
+      // Wait a bit for graceful termination
+      usleep(100000); // 100ms
+      
+      // Check if still running and force kill
+      int wait_result = waitpid(pid, &status, WNOHANG);
+      if (wait_result == 0) {
+        // Still running, force kill
+        killpg(pid, SIGKILL);
+      }
+      
+      onLine("[STOPPED] Task was terminated by user");
+    }
+
+    // Read remaining output
+    while (true) {
+      bytes = read(pipe_stdout[0], chunk, sizeof(chunk));
+      if (bytes <= 0) break;
+      buffer.append(chunk, bytes);
+      size_t pos = 0;
+      size_t nl;
+      while ((nl = buffer.find_first_of("\r\n", pos)) != std::string::npos) {
+        if (nl > pos) {
+          std::string line = buffer.substr(pos, nl - pos);
+          // Strip ANSI escape sequences
+          line = stripAnsiCodes(line);
+          onLine(line);
+        }
+        size_t next = nl + 1;
+        if (next < buffer.size() &&
+            ((buffer[nl] == '\r' && buffer[next] == '\n') ||
+             (buffer[nl] == '\n' && buffer[next] == '\r')))
+          next++;
+        pos = next;
+      }
+      if (pos > 0)
+        buffer.erase(0, pos);
+    }
+    
+    // Read remaining stderr
+    while (true) {
+      bytes = read(pipe_stderr[0], chunk, sizeof(chunk));
+      if (bytes <= 0) break;
+      buffer.append(chunk, bytes);
+      size_t pos = 0;
+      size_t nl;
+      while ((nl = buffer.find_first_of("\r\n", pos)) != std::string::npos) {
+        if (nl > pos) {
+          std::string line = buffer.substr(pos, nl - pos);
+          // Strip ANSI escape sequences
+          line = stripAnsiCodes(line);
+          onLine(line);
+        }
+        size_t next = nl + 1;
+        if (next < buffer.size() &&
+            ((buffer[nl] == '\r' && buffer[next] == '\n') ||
+             (buffer[nl] == '\n' && buffer[next] == '\r')))
+          next++;
+        pos = next;
+      }
+      if (pos > 0)
+        buffer.erase(0, pos);
+    }
+    
+    if (!buffer.empty())
+      onLine(buffer);
+
+    // Wait for process with timeout
+    int timeout_count = 0;
+    while (timeout_count < 500) { // 5 second timeout (500 * 10ms)
+      int wait_result = waitpid(pid, &status, WNOHANG);
+      if (wait_result == pid) {
+        // Process finished
+        if (WIFEXITED(status)) {
+          out_exit_code = WEXITSTATUS(status);
+        } else {
+          out_exit_code = 1;
+        }
+        break;
+      }
+      usleep(10000); // 10ms
+      timeout_count++;
+    }
+    
+    if (timeout_count >= 500) {
+      // Timeout - kill the process
+      killpg(pid, SIGKILL);
+      out_exit_code = 1;
+    }
+
+    close(pipe_stdout[0]);
+    close(pipe_stderr[0]);
+    return true;
+  }
+}
+#endif
 
 // NEW: Thread function for TaskInstance
 void ExecuteTaskThread(std::shared_ptr<TaskInstance> task) {
@@ -2349,7 +3035,11 @@ void ExecuteTaskThread(std::shared_ptr<TaskInstance> task) {
     if (c == '/')
       c = '\\';
 
+#ifdef _WIN32
   DWORD code = 0;
+#else
+  int code = 0;
+#endif
   auto onLine = [&](const std::string &ln) {
     std::lock_guard<std::mutex> lock(task->log_mutex);
     task->log_output.push_back(ln);
@@ -2466,7 +3156,11 @@ void ExecuteCommandThread(const std::string cmd, AppState *state) {
     if (c == '/')
       c = '\\';
 
+#ifdef _WIN32
   DWORD code = 0;
+#else
+  int code = 0;
+#endif
   auto onLine = [&](const std::string &ln) {
     std::lock_guard<std::mutex> lock(state->log_mutex);
     state->log_output.push_back(ln);
@@ -2801,7 +3495,11 @@ static std::vector<std::string> RunShellLines(const std::string &sh) {
 #ifdef _WIN32
   std::string bash = FindBash();
   std::vector<std::string> lines;
+#ifdef _WIN32
   DWORD code = 0;
+#else
+  int code = 0;
+#endif
   if (bash.empty()) {
     lines.push_back(
         "[ERROR] Bash not found. Install Git for Windows or MSYS2.");
@@ -3006,11 +3704,17 @@ static void OpenFolderExternal(const std::string &path) {
       c = '\\';
   std::string cmd = std::string("explorer \"") + p + "\"";
   std::vector<std::string> lines;
+#ifdef _WIN32
   DWORD code = 0;
+#else
+  int code = 0;
+#endif
   RunHiddenCapture(cmd, lines, code);
 #else
-  std::string cmd = std::string("xdg-open \"") + path + "\" >/dev/null 2>&1 &";
-  system(cmd.c_str());
+  std::string cmd = std::string("xdg-open \"") + path + "\"";
+  std::vector<std::string> lines;
+  int code = 0;
+  RunHiddenCapture(cmd, lines, code);
 #endif
 }
 
@@ -5522,6 +6226,8 @@ int main(int argc, char **argv) {
           return;
       }
   #endif
+      // Use SDL minimize for all other platforms (macOS, Linux)
+      // SDL provides proper native minimize on macOS with animation
       SDL_MinimizeWindow(window);
   }
   
@@ -5533,6 +6239,14 @@ int main(int argc, char **argv) {
           ReleaseCapture();
           SendMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
       }
+  }
+  #else
+  // macOS/Linux: Use ImGui's built-in drag functionality
+  static void BeginNativeDrag(SDL_Window* window) {
+      // SDL doesn't have native drag API on macOS/Linux
+      // The drag is handled in the title bar rendering code via ImGui
+      // This provides smooth dragging on all platforms
+      (void)window; // Unused parameter
   }
   #endif
   
