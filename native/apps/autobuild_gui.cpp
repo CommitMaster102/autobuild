@@ -3991,45 +3991,49 @@ std::string BuildCommand(const AppState &state,
 #ifdef _WIN32
   {
     // Get the absolute path to the autobuild.sh script and convert to Unix format
-    char current_dir[MAX_PATH];
-    if (GetCurrentDirectoryA(MAX_PATH, current_dir) > 0) {
-      std::string script_path = std::string(current_dir) + "/../autobuild/scripts/autobuild.sh";
-      // Convert Windows path to Unix format for bash
-      for (char &c : script_path) {
-        if (c == '\\') c = '/';
-      }
-      // Convert C: to /c for MSYS2/Git Bash
-      if (script_path.length() >= 2 && script_path[1] == ':') {
-        script_path[0] = tolower(script_path[0]);
-        script_path = "/" + script_path.substr(0, 1) + script_path.substr(2);
-      }
-      
-      const char *head =
-          "export PATH=/c/Program\\ "
-          "Files/Docker/Docker/resources/bin:/mingw64/bin:/usr/bin:$PATH; export "
-          "PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8; ";
-      // Use single quotes around the script path to handle spaces properly
-      std::string quoted_script_path = "'" + script_path + "'";
-      
-      cmd = std::string("\"") + bash + "\" -lc \"" + head +
-            "if command -v stdbuf >/dev/null 2>&1; then stdbuf -oL -eL bash " +
-            quoted_script_path + " " + args + "; else bash " + quoted_script_path + " " + args +
-            "; fi\"";
-    } else {
-      // Fallback to relative path
-      const char *head =
-          "export PATH=/c/Program\\ "
-          "Files/Docker/Docker/resources/bin:/mingw64/bin:/usr/bin:$PATH; export "
-          "PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8; ";
-      cmd = std::string("\"") + bash + "\" -lc \"" + head +
-            "if command -v stdbuf >/dev/null 2>&1; then stdbuf -oL -eL bash "
-            "autobuild/scripts/autobuild.sh " +
-            args + "; else bash autobuild/scripts/autobuild.sh " + args +
-            "; fi\"";
+    // Use GetExecutableDir() instead of GetCurrentDirectoryA() to find script relative to exe
+    std::string exe_dir = GetExecutableDir();
+    // Script is installed inside bin directory: bin/autobuild/scripts/autobuild.sh
+    std::string script_path = exe_dir + "/autobuild/scripts/autobuild.sh";
+    
+    // Convert Windows path to Unix format for bash
+    for (char &c : script_path) {
+      if (c == '\\') c = '/';
     }
+    // Convert C: to /c for MSYS2/Git Bash
+    if (script_path.length() >= 2 && script_path[1] == ':') {
+      script_path[0] = tolower(script_path[0]);
+      script_path = "/" + script_path.substr(0, 1) + script_path.substr(2);
+    }
+    
+    if (g_show_debug_console) {
+      ConsoleLog("[DEBUG][Windows] Script path: " + script_path);
+    }
+      
+    const char *head =
+        "export PATH=/c/Program\\ "
+        "Files/Docker/Docker/resources/bin:/mingw64/bin:/usr/bin:$PATH; export "
+        "PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8; ";
+    // Use single quotes around the script path to handle spaces properly
+    std::string quoted_script_path = "'" + script_path + "'";
+    
+    cmd = std::string("\"") + bash + "\" -lc \"" + head +
+          "if command -v stdbuf >/dev/null 2>&1; then stdbuf -oL -eL bash " +
+          quoted_script_path + " " + args + "; else bash " + quoted_script_path + " " + args +
+          "; fi\"";
   }
 #else
-  cmd = "bash autobuild/scripts/autobuild.sh " + args;
+  // Mac/Linux: Find script relative to executable location
+  std::string exe_dir = GetExecutableDir();
+  std::string script_path = exe_dir + "/autobuild/scripts/autobuild.sh";
+  
+  if (g_show_debug_console) {
+    ConsoleLog("[DEBUG][Mac/Linux] Executable dir: " + exe_dir);
+    ConsoleLog("[DEBUG][Mac/Linux] Script path: " + script_path);
+  }
+  
+  cmd = "bash '" + script_path + "' " + args;
+  
   if (g_show_debug_console) {
     ConsoleLog("[DEBUG][Mac/Linux] BuildCommand result: " + cmd);
   }
