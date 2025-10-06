@@ -4097,8 +4097,16 @@ std::string BuildCommand(const AppState &state,
     // Get the absolute path to the autobuild.sh script and convert to Unix format
     // Use GetExecutableDir() instead of GetCurrentDirectoryA() to find script relative to exe
     std::string exe_dir = GetExecutableDir();
-    // Script is installed inside bin directory: bin/autobuild/scripts/autobuild.sh
-    std::string script_path = exe_dir + "/autobuild/scripts/autobuild.sh";
+    
+    // Determine script path based on installation type
+    std::string script_path;
+    if (exe_dir.find("Program Files") != std::string::npos) {
+      // Script is installed inside bin directory: bin/autobuild/scripts/autobuild.sh
+      script_path = exe_dir + "/autobuild/scripts/autobuild.sh";
+    } else {
+      // Development: go up from build directory to find autobuild folder
+      script_path = exe_dir + "/../autobuild/scripts/autobuild.sh";
+    }
     
     // Convert Windows path to Unix format for bash
     for (char &c : script_path) {
