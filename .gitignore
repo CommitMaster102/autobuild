@@ -26,6 +26,20 @@ compile_commands.json
 CTestTestfile.cmake
 _deps/
 
+# CPack
+CPackConfig.cmake
+CPackSourceConfig.cmake
+CPackProperties.cmake
+_CPack_Packages/
+*.msi
+*.dmg
+*.deb
+*.rpm
+*.tar.gz
+*.zip
+*.7z
+*.tgz
+
 # Visual Studio
 *.vcxproj.user
 *.vcxproj.filters

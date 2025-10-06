@@ -731,11 +731,68 @@ static std::string ToAbsolutePath(const std::string &path) {
 #endif
 }
 
+
 // Compute the default logs directory as an absolute path to project
 // autobuild/logs
 static std::string ResolveDefaultLogsPath() {
   std::string exe_dir = GetExecutableDir();
-  // Typical layout: native/build-gui/autobuild_gui.exe -> repo_root =
+  
+#ifdef _WIN32
+  // Check if we're running from a Program Files installation (MSI)
+  if (exe_dir.find("Program Files") != std::string::npos) {
+    // For MSI installations, use %APPDATA%\Autobuild\logs
+    char* appdata = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&appdata, &len, "APPDATA") == 0 && appdata != nullptr) {
+      std::string logs_path = std::string(appdata) + "\\Autobuild\\logs";
+      free(appdata);
+      return ToAbsolutePath(logs_path);
+    }
+    // Fallback to Documents if APPDATA fails
+    char* documents = nullptr;
+    if (_dupenv_s(&documents, &len, "USERPROFILE") == 0 && documents != nullptr) {
+      std::string logs_path = std::string(documents) + "\\Documents\\Autobuild\\logs";
+      free(documents);
+      return ToAbsolutePath(logs_path);
+    }
+  }
+#elif defined(__APPLE__)
+  // Check if we're running from an installed app bundle
+  if (exe_dir.find(".app/Contents/MacOS") != std::string::npos) {
+    // For installed app bundles, use ~/Library/Application Support/Autobuild/logs
+    const char* home = getenv("HOME");
+    if (home) {
+      std::string logs_path = std::string(home) + "/Library/Application Support/Autobuild/logs";
+      return ToAbsolutePath(logs_path);
+    }
+    // Fallback to ~/.autobuild/logs
+    const char* home_fallback = getenv("HOME");
+    if (home_fallback) {
+      std::string logs_path = std::string(home_fallback) + "/.autobuild/logs";
+      return ToAbsolutePath(logs_path);
+    }
+  }
+#elif defined(__linux__)
+  // Check if we're running from a system installation
+  if (exe_dir.find("/usr/bin") != std::string::npos || 
+      exe_dir.find("/usr/local/bin") != std::string::npos ||
+      exe_dir.find("/opt") != std::string::npos) {
+    // For system installations, use ~/.local/share/autobuild/logs
+    const char* home = getenv("HOME");
+    if (home) {
+      std::string logs_path = std::string(home) + "/.local/share/autobuild/logs";
+      return ToAbsolutePath(logs_path);
+    }
+    // Fallback to ~/.autobuild/logs
+    const char* home_fallback = getenv("HOME");
+    if (home_fallback) {
+      std::string logs_path = std::string(home_fallback) + "/.autobuild/logs";
+      return ToAbsolutePath(logs_path);
+    }
+  }
+#endif
+  
+  // Development layout: native/build-gui/autobuild_gui.exe -> repo_root =
   // exe_dir/../..
   std::string candidate = exe_dir + "/../../autobuild/logs";
   return ToAbsolutePath(candidate);
@@ -901,6 +958,36 @@ bool DirectoryExists(const std::string &path) {
   if (path.empty())
     return false;
   return IsDirectory(path);
+}
+
+// Create directory recursively if it doesn't exist
+static bool CreateDirectoryRecursive(const std::string &path) {
+#ifdef _WIN32
+  // Create all intermediate directories
+  std::string current_path;
+  size_t pos = 0;
+  while ((pos = path.find_first_of("\\/", pos)) != std::string::npos) {
+    current_path = path.substr(0, pos);
+    if (!current_path.empty() && !DirectoryExists(current_path)) {
+      if (!CreateDirectoryA(current_path.c_str(), NULL)) {
+        DWORD error = GetLastError();
+        if (error != ERROR_ALREADY_EXISTS) {
+          return false;
+        }
+      }
+    }
+    pos++;
+  }
+  // Create the final directory
+  if (!DirectoryExists(path)) {
+    return CreateDirectoryA(path.c_str(), NULL) != 0;
+  }
+  return true;
+#else
+  // Use system mkdir -p
+  std::string cmd = "mkdir -p \"" + path + "\"";
+  return system(cmd.c_str()) == 0;
+#endif
 }
 
 // Global debug flag for console output
@@ -1858,7 +1945,10 @@ void LoadConfig(AppState &state) {
 
     // If no log paths loaded, add absolute default
     if (state.log_folder_paths.empty()) {
-      state.log_folder_paths.push_back(ResolveDefaultLogsPath());
+      std::string default_logs_path = ResolveDefaultLogsPath();
+      state.log_folder_paths.push_back(default_logs_path);
+      // Ensure the default logs directory exists
+      CreateDirectoryRecursive(default_logs_path);
     }
 
     // Ensure selected index is valid
@@ -1867,7 +1957,10 @@ void LoadConfig(AppState &state) {
     }
   } else {
     // Default log path if no config file
-    state.log_folder_paths.push_back(ResolveDefaultLogsPath());
+    std::string default_logs_path = ResolveDefaultLogsPath();
+    state.log_folder_paths.push_back(default_logs_path);
+    // Ensure the default logs directory exists
+    CreateDirectoryRecursive(default_logs_path);
   }
 }
 
@@ -3954,7 +4047,7 @@ void RenderMainUI(AppState &state) {
           ImGui::SetColumnWidth(1, 80.0f);  // Fixed width for Delete button
           
           ImGui::BeginChild(("##image_text_" + std::to_string(i)).c_str(),
-                           ImVec2(0, ImGui::GetTextLineHeight() + ImGui::GetStyle().FramePadding.y * 2 - 2),
+                           ImVec2(0, ImGui::GetTextLineHeight() + ImGui::GetStyle().FramePadding.y * 6 - 2),
                            false,
                            ImGuiWindowFlags_HorizontalScrollbar);
           
