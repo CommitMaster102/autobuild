@@ -1328,6 +1328,7 @@ struct AppState {
   std::vector<DockerContainer> containers;
   std::vector<DockerImage> images;
   bool docker_loaded = false;
+  bool docker_unavailable = false; // Set to true when Docker is not running/accessible
   // Manage Logs state
   int selected_task_index = -1;
   int selected_run_index = -1;
@@ -3755,11 +3756,45 @@ static std::string GuessLogPathForContainer(const AppState &state,
 static void RefreshDockerState(AppState &state) {
   state.containers.clear();
   state.images.clear();
+  state.docker_unavailable = false;
+  
+  // Check if Docker is available by running a simple ping command
+  auto ping_result = RunShellLines("docker info 2>&1");
+  bool docker_available = false;
+  for (const auto &ln : ping_result) {
+    // Check for common Docker unavailability errors
+    if (ln.find("error during connect") != std::string::npos ||
+        ln.find("Cannot connect to the Docker daemon") != std::string::npos ||
+        ln.find("Is the docker daemon running") != std::string::npos ||
+        ln.find("no puede encontrar") != std::string::npos ||  // Spanish: "cannot find"
+        ln.find("El sistema no puede encontrar") != std::string::npos) {
+      state.docker_unavailable = true;
+      state.docker_loaded = true;
+      return;
+    }
+    // If we see valid Docker info output, it's available
+    if (ln.find("Server Version") != std::string::npos ||
+        ln.find("Containers:") != std::string::npos) {
+      docker_available = true;
+    }
+  }
+  
+  // If Docker ping failed completely, mark as unavailable
+  if (!docker_available && !ping_result.empty()) {
+    state.docker_unavailable = true;
+    state.docker_loaded = true;
+    return;
+  }
+  
   auto cl = RunShellLines(
       "docker ps -a --format "
       "'{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.CreatedAt}}'");
   for (const auto &ln : cl) {
     if (ln.empty())
+      continue;
+    // Skip error lines
+    if (ln.find("error during connect") != std::string::npos ||
+        ln.find("Cannot connect") != std::string::npos)
       continue;
     std::stringstream ss(ln);
     std::string id, name, image, status, created;
@@ -3781,6 +3816,10 @@ static void RefreshDockerState(AppState &state) {
       "docker images --format '{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}'");
   for (const auto &ln : il) {
     if (ln.empty())
+      continue;
+    // Skip error lines
+    if (ln.find("error during connect") != std::string::npos ||
+        ln.find("Cannot connect") != std::string::npos)
       continue;
     std::stringstream ss(ln);
     std::string repo, id, size;
@@ -4728,6 +4767,26 @@ void RenderMainUI(AppState &state) {
       ImGui::TextDisabled("(Docker containers, images, logs)");
       ImGui::Separator();
 
+      // Show user-friendly message if Docker is not available
+      if (state.docker_unavailable) {
+        ImGui::Spacing();
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.4f, 1.0f)); // Orange warning color
+        ImGui::TextWrapped("Docker Desktop is not running or not accessible.");
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+        ImGui::TextWrapped("Please start Docker Desktop and click the Refresh button above to load containers and images.");
+        ImGui::Spacing();
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.7f, 0.7f, 1.0f)); // Gray info text
+        ImGui::TextWrapped("If Docker is installed:");
+        ImGui::BulletText("Windows: Start Docker Desktop from the Start menu");
+        ImGui::BulletText("macOS: Start Docker Desktop from Applications");
+        ImGui::BulletText("Linux: Run 'sudo systemctl start docker'");
+        ImGui::PopStyleColor();
+      } else {
+        // Docker is available - show containers and images
+
       // Containers list
       ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Containers");
 
@@ -5018,6 +5077,7 @@ void RenderMainUI(AppState &state) {
 
       // Confirmation modal moved to global scope (after TabBar)
 
+      } // end else (Docker is available)
       // _tab_manage RAII closes the tab
     }
   }
