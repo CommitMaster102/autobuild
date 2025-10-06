@@ -2200,7 +2200,58 @@ static bool RemoveDirectoryRecursive(const std::string &path) {
 }
 
 // Config file management with JSON format
-const char *CONFIG_FILE = "autobuild_gui.json";
+// Get platform-specific config file path
+static std::string GetConfigFilePath() {
+  std::string exe_dir = GetExecutableDir();
+  
+#ifdef _WIN32
+  // Windows: Check if we're in Program Files (MSI install)
+  if (exe_dir.find("Program Files") != std::string::npos) {
+    // MSI install: use APPDATA
+    const char* appdata = getenv("APPDATA");
+    if (appdata != nullptr) {
+      std::string config_dir = std::string(appdata) + "\\Autobuild";
+      CreateDirectoryRecursive(config_dir);
+      return config_dir + "\\autobuild_gui.json";
+    }
+    // Fallback to Documents
+    const char* userprofile = getenv("USERPROFILE");
+    if (userprofile != nullptr) {
+      std::string config_dir = std::string(userprofile) + "\\Documents\\Autobuild";
+      CreateDirectoryRecursive(config_dir);
+      return config_dir + "\\autobuild_gui.json";
+    }
+  }
+  // Development: use relative to exe
+  return exe_dir + "\\autobuild_gui.json";
+  
+#elif defined(__APPLE__)
+  // macOS: Use Application Support
+  const char* home = getenv("HOME");
+  if (home) {
+    std::string config_dir = std::string(home) + "/Library/Application Support/Autobuild";
+    CreateDirectoryRecursive(config_dir);
+    return config_dir + "/autobuild_gui.json";
+  }
+  return exe_dir + "/autobuild_gui.json";
+  
+#else // Linux
+  // Linux: Use XDG_CONFIG_HOME or ~/.config
+  const char* xdg_config = getenv("XDG_CONFIG_HOME");
+  if (xdg_config && xdg_config[0] != '\0') {
+    std::string config_dir = std::string(xdg_config) + "/autobuild";
+    CreateDirectoryRecursive(config_dir);
+    return config_dir + "/autobuild_gui.json";
+  }
+  const char* home = getenv("HOME");
+  if (home) {
+    std::string config_dir = std::string(home) + "/.config/autobuild";
+    CreateDirectoryRecursive(config_dir);
+    return config_dir + "/autobuild_gui.json";
+  }
+  return exe_dir + "/autobuild_gui.json";
+#endif
+}
 
 // Simple JSON escape function
 std::string JsonEscape(const std::string &str) {
@@ -2247,7 +2298,11 @@ std::string JsonUnescape(const std::string &str) {
 }
 
 void SaveConfig(const AppState &state) {
-  std::ofstream file(CONFIG_FILE);
+  std::string config_path = GetConfigFilePath();
+  if (g_show_debug_console) {
+    ConsoleLog("[DEBUG] Saving config to: " + config_path);
+  }
+  std::ofstream file(config_path);
   if (file.is_open()) {
     file << "{\n";
 
@@ -2281,7 +2336,11 @@ void SaveConfig(const AppState &state) {
 }
 
 void LoadConfig(AppState &state) {
-  std::ifstream file(CONFIG_FILE);
+  std::string config_path = GetConfigFilePath();
+  if (g_show_debug_console) {
+    ConsoleLog("[DEBUG] Loading config from: " + config_path);
+  }
+  std::ifstream file(config_path);
   if (file.is_open()) {
     std::string line;
     bool in_array = false;
@@ -4405,8 +4464,8 @@ void RenderMainUI(AppState &state) {
           ImGui::SameLine();
           ImGui::TextDisabled("(?)");
           if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip(
-                "API Key is automatically saved to autobuild_gui.json");
+            std::string config_path = GetConfigFilePath();
+            ImGui::SetTooltip("API Key is automatically saved to:\n%s", config_path.c_str());
           }
 
           char key_buf[256];
