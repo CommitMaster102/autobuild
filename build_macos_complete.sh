@@ -176,6 +176,9 @@ if [ -n "$DMG_FILE" ]; then
     echo ""
     echo " Your macOS DMG is ready for distribution!"
     echo "   Users can simply drag the app to Applications folder."
+    echo ""
+    echo " To test the animation, run:"
+    echo "   ./launch_with_animation_macos.sh"
 else
     echo " DMG creation failed"
     exit 1

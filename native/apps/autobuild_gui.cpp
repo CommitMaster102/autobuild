@@ -227,6 +227,43 @@ struct TitleBarState {
 static bool RenderCustomTitleBarSimple(SDL_Window *window, TitleBarState &tb);
 
 
+// Helper function to parse shell command with proper quote handling
+static std::vector<std::string> ParseShellCommand(const std::string &command) {
+  std::vector<std::string> tokens;
+  std::string current_token;
+  bool in_single_quote = false;
+  bool in_double_quote = false;
+  bool escaped = false;
+  
+  for (size_t i = 0; i < command.length(); ++i) {
+    char c = command[i];
+    
+    if (escaped) {
+      current_token += c;
+      escaped = false;
+    } else if (c == '\\') {
+      escaped = true;
+    } else if (c == '\'' && !in_double_quote) {
+      in_single_quote = !in_single_quote;
+    } else if (c == '"' && !in_single_quote) {
+      in_double_quote = !in_double_quote;
+    } else if (c == ' ' && !in_single_quote && !in_double_quote) {
+      if (!current_token.empty()) {
+        tokens.push_back(current_token);
+        current_token.clear();
+      }
+    } else {
+      current_token += c;
+    }
+  }
+  
+  if (!current_token.empty()) {
+    tokens.push_back(current_token);
+  }
+  
+  return tokens;
+}
+
 // Helper function to check if a Docker image exists
 static bool DockerImageExists(const std::string &image_name) {
   std::string cmd =
@@ -863,14 +900,9 @@ static bool RunHiddenCaptureExe(const std::string &exe, const std::string &args,
     close(pipe_stdout[1]);
     close(pipe_stderr[1]);
 
-    // Build command array
+    // Build command array with proper shell parsing
     std::string full_command = exe + " " + args;
-    std::vector<std::string> tokens;
-    std::stringstream ss(full_command);
-    std::string token;
-    while (ss >> token) {
-      tokens.push_back(token);
-    }
+    std::vector<std::string> tokens = ParseShellCommand(full_command);
     
     // Convert to char* array
     std::vector<char*> argv;
@@ -2184,7 +2216,7 @@ static bool RemoveDirectoryRecursive(const std::string &path) {
     return false;
   struct dirent *ent;
   while ((ent = readdir(dir)) != NULL) {
-    if (!ent->d_name || ent->d_name[0] == '.')
+    if (ent->d_name[0] == '.')
       continue;
     std::string child = path + "/" + ent->d_name;
     if (IsDirectory(child)) {
@@ -2876,14 +2908,9 @@ static bool RunHiddenStreamExeWithHandle(
     close(pipe_stdout[1]);
     close(pipe_stderr[1]);
 
-    // Build command array
+    // Build command array with proper shell parsing
     std::string full_command = exe + " " + args;
-    std::vector<std::string> tokens;
-    std::stringstream ss(full_command);
-    std::string token;
-    while (ss >> token) {
-      tokens.push_back(token);
-    }
+    std::vector<std::string> tokens = ParseShellCommand(full_command);
     
     // Convert to char* array
     std::vector<char*> argv;
@@ -3197,13 +3224,39 @@ void ExecuteTaskThread(std::shared_ptr<TaskInstance> task) {
   if (g_show_debug_console) {
     ConsoleLog("[DEBUG][Mac/Linux] ExecuteTaskThread command: " + task->command);
   }
-  FILE *pipe = popen(task->command.c_str(), "r");
+  
+  // On macOS, use shell execution for better compatibility
+  std::string shell_cmd;
+#ifdef __APPLE__
+  // Use bash explicitly for macOS
+  // Properly escape single quotes inside the command for safe single-quoted bash -c
+  {
+    std::string cmd_escaped;
+    cmd_escaped.reserve(task->command.size() + 8);
+    for (char c : task->command) {
+      if (c == '\'') {
+        cmd_escaped += "'\"'\"'"; // close ', insert literal ', reopen '
+      } else {
+        cmd_escaped += c;
+      }
+    }
+    shell_cmd = "bash -c '" + cmd_escaped + "'";
+  }
+#else
+  shell_cmd = task->command;
+#endif
+  
+  if (g_show_debug_console) {
+    ConsoleLog("[DEBUG][Mac/Linux] Final shell command: " + shell_cmd);
+  }
+  
+  FILE *pipe = popen(shell_cmd.c_str(), "r");
   if (!pipe) {
     if (g_show_debug_console) {
       ConsoleLog("[ERROR][Mac/Linux] popen failed: " + std::string(strerror(errno)));
     }
     std::lock_guard<std::mutex> lock(task->log_mutex);
-    task->log_output.push_back("[ERROR] Failed to execute command");
+    task->log_output.push_back("[ERROR] Failed to execute command: " + std::string(strerror(errno)));
     task->is_running = false;
     return;
   }
@@ -3218,6 +3271,8 @@ void ExecuteTaskThread(std::shared_ptr<TaskInstance> task) {
       task->log_output.erase(task->log_output.begin());
   }
   int ret = pclose(pipe);
+  int exit_code = WEXITSTATUS(ret);
+  
   {
     std::lock_guard<std::mutex> lock(task->log_mutex);
     if (task->should_stop) {
@@ -3225,17 +3280,26 @@ void ExecuteTaskThread(std::shared_ptr<TaskInstance> task) {
         ConsoleLog("[DEBUG][Mac/Linux] Task stopped by user");
       }
       task->log_output.push_back("[STOPPED] Task terminated");
-    } else if (ret == 0) {
+    } else if (exit_code == 0) {
       if (g_show_debug_console) {
         ConsoleLog("[DEBUG][Mac/Linux] Task completed successfully");
       }
       task->log_output.push_back("[SUCCESS] Command completed successfully");
     } else {
       if (g_show_debug_console) {
-        ConsoleLog("[ERROR][Mac/Linux] Task failed with exit code: " + std::to_string(ret));
+        ConsoleLog("[ERROR][Mac/Linux] Task failed with exit code: " + std::to_string(exit_code) + " (raw pclose: " + std::to_string(ret) + ")");
       }
       task->log_output.push_back("[ERROR] Command failed with exit code: " +
-                                 std::to_string(ret));
+                                 std::to_string(exit_code));
+      
+      // Add more detailed error information for common issues
+      if (exit_code == 127) {
+        task->log_output.push_back("[ERROR] Command not found - check if bash and script paths are correct");
+      } else if (exit_code == 126) {
+        task->log_output.push_back("[ERROR] Command is not executable - check script permissions");
+      } else if (exit_code == 1) {
+        task->log_output.push_back("[ERROR] General error - check script execution and dependencies");
+      }
     }
   }
 #endif
@@ -3710,7 +3774,7 @@ static bool FindDirByName(const std::string &root, const std::string &needle,
   bool ok = false;
   struct stat st{};
   while (!ok && (e = readdir(d)) != NULL) {
-    if (!e->d_name || e->d_name[0] == '.')
+    if (e->d_name[0] == '.')
       continue;
     std::string name(e->d_name);
     std::string p = root + "/" + name;
@@ -3742,7 +3806,7 @@ static std::string FindLatestModePath(const std::string &root,
   struct dirent *task_ent;
   struct stat st{};
   while ((task_ent = readdir(root_dir)) != NULL) {
-    if (!task_ent->d_name || task_ent->d_name[0] == '.')
+    if (task_ent->d_name[0] == '.')
       continue;
     std::string task_dir = root + "/" + task_ent->d_name;
     if (!DirectoryExists(task_dir))
@@ -3752,7 +3816,7 @@ static std::string FindLatestModePath(const std::string &root,
       continue;
     struct dirent *ts_ent;
     while ((ts_ent = readdir(ts_dir)) != NULL) {
-      if (!ts_ent->d_name || ts_ent->d_name[0] == '.')
+      if (ts_ent->d_name[0] == '.')
         continue;
       std::string ts_path = task_dir + "/" + ts_ent->d_name;
       if (!DirectoryExists(ts_path))
@@ -3961,10 +4025,19 @@ std::string BuildCommand(const AppState &state,
     args += "audit";
     break;
   }
+#ifdef _WIN32
+  // Windows cmd.exe style: use backslash-escaped double quotes
   if (!task_dir_unix.empty())
     args += " --task \\\"" + task_dir_unix + "\\\"";
   if (!state.api_key.empty())
     args += " --api-key \\\"" + state.api_key + "\\\"";
+#else
+  // Unix shell style: use single quotes for paths/values with spaces
+  if (!task_dir_unix.empty())
+    args += " --task '" + task_dir_unix + "'";
+  if (!state.api_key.empty())
+    args += " --api-key '" + state.api_key + "'";
+#endif
 
   // NEW: Add --no-cache flag if enabled
   if (state.use_docker_no_cache) {
@@ -3990,7 +4063,11 @@ std::string BuildCommand(const AppState &state,
     // Ensure the final image name is unique to avoid conflicts with existing
     // images
     image_tag = GenerateUniqueImageName(image_tag);
+#ifdef _WIN32
     args += " --image-tag \\\"" + image_tag + "\\\"";
+#else
+    args += " --image-tag '" + image_tag + "'";
+#endif
   } else if (state.auto_lowercase_names && !state.task_directory.empty()) {
     std::string task_dir = state.task_directory;
     size_t last_slash = task_dir.find_last_of("/\\");
@@ -4008,7 +4085,11 @@ std::string BuildCommand(const AppState &state,
     // Ensure the final image name is unique to avoid conflicts with existing
     // images
     auto_tag = GenerateUniqueImageName(auto_tag);
+#ifdef _WIN32
     args += " --image-tag \\\"" + auto_tag + "\\\"";
+#else
+    args += " --image-tag '" + auto_tag + "'";
+#endif
   }
   if (!state.container_name.empty()) {
     std::string container_name = state.container_name;
@@ -4020,7 +4101,11 @@ std::string BuildCommand(const AppState &state,
     if (!unique_suffix.empty()) {
       container_name += "_from_" + unique_suffix;
     }
+#ifdef _WIN32
     args += " --container-name \\\"" + container_name + "\\\"";
+#else
+    args += " --container-name '" + container_name + "'";
+#endif
   } else if (state.auto_lowercase_names && !state.task_directory.empty()) {
     std::string task_dir = state.task_directory;
     size_t last_slash = task_dir.find_last_of("/\\");
@@ -4034,10 +4119,19 @@ std::string BuildCommand(const AppState &state,
     if (!unique_suffix.empty()) {
       auto_container += "_from_" + unique_suffix;
     }
+#ifdef _WIN32
     args += " --container-name \\\"" + auto_container + "\\\"";
+#else
+    args += " --container-name '" + auto_container + "'";
+#endif
   }
+#ifdef _WIN32
   if (!workdir_unix.empty())
     args += " --workdir \\\"" + workdir_unix + "\\\"";
+#else
+  if (!workdir_unix.empty())
+    args += " --workdir '" + workdir_unix + "'";
+#endif
   
   // Only pass --output-dir if user explicitly set one
   // Otherwise, let the script use its default: $base_logs_dir/$task_name/$timestamp
@@ -4048,7 +4142,11 @@ std::string BuildCommand(const AppState &state,
     if (!unique_suffix.empty()) {
       final_output_dir += "_" + unique_suffix;
     }
+#ifdef _WIN32
     args += " --output-dir \\\"" + final_output_dir + "\\\"";
+#else
+    args += " --output-dir '" + final_output_dir + "'";
+#endif
   }
   
   // Set AUTOBUILD_LOGS_ROOT environment variable to point script to user-accessible location
@@ -4149,17 +4247,102 @@ std::string BuildCommand(const AppState &state,
   std::string exe_dir = GetExecutableDir();
   std::string script_path = exe_dir + "/autobuild/scripts/autobuild.sh";
   
+  // On macOS, check if we're in an app bundle and adjust path accordingly
+#ifdef __APPLE__
+  // Check if we're running from an app bundle
+  if (exe_dir.find(".app/Contents/MacOS") != std::string::npos) {
+    // We're in an app bundle, script should be in the bundle resources
+    size_t bundle_pos = exe_dir.find(".app/Contents/MacOS");
+    std::string bundle_path = exe_dir.substr(0, bundle_pos + 4); // Include .app
+    script_path = bundle_path + "/Contents/Resources/autobuild/scripts/autobuild.sh";
+    
+    if (g_show_debug_console) {
+      ConsoleLog("[DEBUG][macOS] App bundle detected, trying script path: " + script_path);
+    }
+    
+    // Fallback: try multiple possible locations if the bundle path doesn't exist
+    if (!FileExists(script_path)) {
+      // Try the original path first
+      script_path = exe_dir + "/autobuild/scripts/autobuild.sh";
+      if (g_show_debug_console) {
+        ConsoleLog("[DEBUG][macOS] Bundle path not found, trying fallback: " + script_path);
+      }
+      
+      // If still not found, try other common locations
+      if (!FileExists(script_path)) {
+        std::vector<std::string> fallback_paths = {
+          bundle_path + "/Contents/MacOS/autobuild/scripts/autobuild.sh",
+          bundle_path + "/Contents/Resources/autobuild.sh",
+          exe_dir + "/../Resources/autobuild/scripts/autobuild.sh",
+          exe_dir + "/../autobuild/scripts/autobuild.sh"
+        };
+        
+        for (const auto& fallback_path : fallback_paths) {
+          if (FileExists(fallback_path)) {
+            script_path = fallback_path;
+            if (g_show_debug_console) {
+              ConsoleLog("[DEBUG][macOS] Found script at: " + script_path);
+            }
+            break;
+          }
+        }
+      }
+    }
+  }
+#endif
+  
   if (g_show_debug_console) {
     ConsoleLog("[DEBUG][Mac/Linux] Executable dir: " + exe_dir);
     ConsoleLog("[DEBUG][Mac/Linux] Script path: " + script_path);
+    ConsoleLog(std::string("[DEBUG][Mac/Linux] Script exists: ") + (FileExists(script_path) ? "YES" : "NO"));
     ConsoleLog("[DEBUG][Mac/Linux] Logs root: " + logs_root_for_env);
+  }
+  
+  // Verify script exists before proceeding
+  if (!FileExists(script_path)) {
+    std::string error_msg = "echo 'ERROR: autobuild.sh script not found. ";
+    error_msg += "Searched at: " + script_path;
+#ifdef __APPLE__
+    error_msg += " (macOS app bundle)";
+#endif
+    error_msg += " Please ensure the script is properly installed.'";
+    return error_msg;
+  }
+  
+  // On macOS, ensure script is executable
+#ifdef __APPLE__
+  struct stat script_stat;
+  if (stat(script_path.c_str(), &script_stat) == 0) {
+    if (!(script_stat.st_mode & S_IXUSR)) {
+      if (g_show_debug_console) {
+        ConsoleLog("[DEBUG][macOS] Making script executable: " + script_path);
+      }
+      chmod(script_path.c_str(), script_stat.st_mode | S_IXUSR | S_IXGRP | S_IXOTH);
+    }
+  }
+#endif
+  
+  // Set up PATH to include Docker and other essential tools
+  // macOS GUI apps don't inherit shell PATH, so we need to set it explicitly
+  // Include common Docker/tool locations for both Intel and Apple Silicon Macs
+  std::string path_setup = "export PATH=\"/usr/local/bin:/opt/homebrew/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+  
+  // Add Docker Desktop's resources/bin directory if it exists
+  path_setup += ":/Applications/Docker.app/Contents/Resources/bin";
+  
+  // Preserve any existing PATH
+  path_setup += ":$PATH\"; ";
+  
+  // Verify Docker is accessible and log it
+  if (g_show_debug_console) {
+    ConsoleLog("[DEBUG][macOS] Using PATH: " + path_setup);
   }
   
   // Set AUTOBUILD_LOGS_ROOT environment variable if we have a logs root
   if (!logs_root_for_env.empty()) {
-    cmd = "export AUTOBUILD_LOGS_ROOT='" + logs_root_for_env + "'; bash '" + script_path + "' " + args;
+    cmd = path_setup + "export AUTOBUILD_LOGS_ROOT='" + logs_root_for_env + "'; bash '" + script_path + "' " + args;
   } else {
-    cmd = "bash '" + script_path + "' " + args;
+    cmd = path_setup + "bash '" + script_path + "' " + args;
   }
   
   if (g_show_debug_console) {
@@ -4167,7 +4350,7 @@ std::string BuildCommand(const AppState &state,
   }
 #endif
 
-  return cmd;
+ return cmd;
 }
 
 void RenderMainUI(AppState &state) {
@@ -5101,7 +5284,7 @@ void RenderMainUI(AppState &state) {
           int idx = 0;
           struct dirent *e;
           while ((e = readdir(d)) != NULL) {
-            if (!e->d_name || e->d_name[0] == '.')
+            if (e->d_name[0] == '.')
               continue;
             std::string task_dir = logs_root + "/" + e->d_name;
             if (!DirectoryExists(task_dir))
@@ -5128,7 +5311,7 @@ void RenderMainUI(AppState &state) {
         if (d2) {
           struct dirent *e;
           while ((e = readdir(d2)) != NULL) {
-            if (!e->d_name || e->d_name[0] == '.')
+            if (e->d_name[0] == '.')
               continue;
             std::string task_dir = logs_root + "/" + e->d_name;
             if (!DirectoryExists(task_dir))
@@ -5148,7 +5331,7 @@ void RenderMainUI(AppState &state) {
             int idx = 0;
             struct dirent *e;
             while ((e = readdir(d3)) != NULL) {
-              if (!e->d_name || e->d_name[0] == '.')
+              if (e->d_name[0] == '.')
                 continue;
               std::string run_dir = task_dir + "/" + e->d_name;
               if (!DirectoryExists(run_dir))
@@ -5178,7 +5361,7 @@ void RenderMainUI(AppState &state) {
           if (d4) {
             struct dirent *e;
             while ((e = readdir(d4)) != NULL) {
-              if (!e->d_name || e->d_name[0] == '.')
+              if (e->d_name[0] == '.')
                 continue;
               std::string run_dir = task_dir + "/" + e->d_name;
               if (!DirectoryExists(run_dir))
@@ -6196,42 +6379,59 @@ int main(int argc, char **argv) {
   
   // Load Font Awesome fonts with error handling
   // Use smaller font size to match ImGui default (around 13px)
-  // Try multiple possible paths for font files
-  const char* possible_solid_paths[] = {
+  // Try multiple possible paths for font files, including macOS app bundle
+  std::string exe_dir_for_fonts = GetExecutableDir();
+  std::vector<std::string> possible_solid_paths = {
     "resources/fonts/fa-solid-900.ttf",
     "./resources/fonts/fa-solid-900.ttf",
     "../resources/fonts/fa-solid-900.ttf",
-    "../../resources/fonts/fa-solid-900.ttf"
+    "../../resources/fonts/fa-solid-900.ttf",
+    exe_dir_for_fonts + "/resources/fonts/fa-solid-900.ttf",
+    exe_dir_for_fonts + "/../Resources/fonts/fa-solid-900.ttf",
+    exe_dir_for_fonts + "/../Resources/fa-solid-900.ttf"
   };
   
-  const char* possible_regular_paths[] = {
+  std::vector<std::string> possible_regular_paths = {
     "resources/fonts/fa-regular-400.ttf",
     "./resources/fonts/fa-regular-400.ttf",
     "../resources/fonts/fa-regular-400.ttf",
-    "../../resources/fonts/fa-regular-400.ttf"
+    "../../resources/fonts/fa-regular-400.ttf",
+    exe_dir_for_fonts + "/resources/fonts/fa-regular-400.ttf",
+    exe_dir_for_fonts + "/../Resources/fonts/fa-regular-400.ttf",
+    exe_dir_for_fonts + "/../Resources/fa-regular-400.ttf"
   };
   
-  const char* solid_font_path = "resources/fonts/fa-solid-900.ttf";
-  const char* regular_font_path = "resources/fonts/fa-regular-400.ttf";
+  std::string solid_font_path = "";
+  std::string regular_font_path = "";
   
   // Find the correct path for solid font
-  for (int i = 0; i < 4; i++) {
-    FILE* test = fopen(possible_solid_paths[i], "rb");
+  for (const auto& path : possible_solid_paths) {
+    FILE* test = fopen(path.c_str(), "rb");
     if (test) {
-      solid_font_path = possible_solid_paths[i];
+      solid_font_path = path;
       fclose(test);
+      if (show_debug_info) printf("Found solid font at: %s\n", path.c_str());
       break;
     }
   }
   
   // Find the correct path for regular font
-  for (int i = 0; i < 4; i++) {
-    FILE* test = fopen(possible_regular_paths[i], "rb");
+  for (const auto& path : possible_regular_paths) {
+    FILE* test = fopen(path.c_str(), "rb");
     if (test) {
-      regular_font_path = possible_regular_paths[i];
+      regular_font_path = path;
       fclose(test);
+      if (show_debug_info) printf("Found regular font at: %s\n", path.c_str());
       break;
     }
+  }
+  
+  // Log if fonts not found
+  if (solid_font_path.empty()) {
+    ConsoleLog("[WARN] Font Awesome Solid font not found, using fallback");
+  }
+  if (regular_font_path.empty()) {
+    ConsoleLog("[WARN] Font Awesome Regular font not found, using fallback");
   }
   
   // Load Font Awesome fonts with proper glyph ranges
@@ -6252,16 +6452,22 @@ int main(int argc, char **argv) {
   regular_config.GlyphMinAdvanceX = 13.0f; // Set minimum advance for better rendering
   
   // Use larger font size to prevent blurriness
-  g_font_awesome_solid = io.Fonts->AddFontFromFileTTF(solid_font_path, 13.0f, &solid_config);
+  if (!solid_font_path.empty()) {
+    g_font_awesome_solid = io.Fonts->AddFontFromFileTTF(solid_font_path.c_str(), 13.0f, &solid_config);
+  }
   if (!g_font_awesome_solid) {
     // Fallback to default font
     g_font_awesome_solid = io.Fonts->Fonts[0];
+    if (show_debug_info) printf("Using fallback for solid font\n");
   }
   
-  g_font_awesome_regular = io.Fonts->AddFontFromFileTTF(regular_font_path, 13.0f, &regular_config);
+  if (!regular_font_path.empty()) {
+    g_font_awesome_regular = io.Fonts->AddFontFromFileTTF(regular_font_path.c_str(), 13.0f, &regular_config);
+  }
   if (!g_font_awesome_regular) {
     // Fallback to default font
     g_font_awesome_regular = io.Fonts->Fonts[0];
+    if (show_debug_info) printf("Using fallback for regular font\n");
   }
   
   // Check if both fonts loaded successfully

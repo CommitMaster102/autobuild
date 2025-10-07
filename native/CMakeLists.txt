@@ -139,6 +139,17 @@ if(SDL2_FOUND)
         "${FONTS_DIR}/fa-solid-900.ttf"
         "${CMAKE_CURRENT_BINARY_DIR}/resources/fonts/fa-solid-900.ttf"
         COMMENT "Copying Font Awesome Solid font")
+      
+      # Also copy to macOS app bundle if building bundle
+      if(APPLE)
+        add_custom_command(TARGET autobuild_main POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E make_directory
+          "$<TARGET_BUNDLE_DIR:autobuild_main>/Contents/Resources"
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${FONTS_DIR}/fa-solid-900.ttf"
+          "$<TARGET_BUNDLE_DIR:autobuild_main>/Contents/Resources/fa-solid-900.ttf"
+          COMMENT "Copying Font Awesome Solid font to app bundle")
+      endif()
     endif()
 
     if(EXISTS "${FONTS_DIR}/fa-regular-400.ttf")
@@ -149,6 +160,17 @@ if(SDL2_FOUND)
         "${FONTS_DIR}/fa-regular-400.ttf"
         "${CMAKE_CURRENT_BINARY_DIR}/resources/fonts/fa-regular-400.ttf"
         COMMENT "Copying Font Awesome Regular font")
+      
+      # Also copy to macOS app bundle if building bundle
+      if(APPLE)
+        add_custom_command(TARGET autobuild_main POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E make_directory
+          "$<TARGET_BUNDLE_DIR:autobuild_main>/Contents/Resources"
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${FONTS_DIR}/fa-regular-400.ttf"
+          "$<TARGET_BUNDLE_DIR:autobuild_main>/Contents/Resources/fa-regular-400.ttf"
+          COMMENT "Copying Font Awesome Regular font to app bundle")
+      endif()
     endif()
 
     # Install the main GUI application
@@ -429,7 +451,15 @@ endif()
 # Place it under <prefix>/<bindir>/autobuild/scripts/autobuild.sh
 set(_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 if(EXISTS "${_REPO_ROOT}/autobuild/scripts/autobuild.sh")
-  install(FILES "${_REPO_ROOT}/autobuild/scripts/autobuild.sh"
-    DESTINATION ${CMAKE_INSTALL_BINDIR}/autobuild/scripts
-    PERMISSIONS OWNER_READ OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+  if(APPLE)
+    # For macOS app bundles, install to Resources directory
+    install(FILES "${_REPO_ROOT}/autobuild/scripts/autobuild.sh"
+      DESTINATION ${CMAKE_INSTALL_BINDIR}/../Resources/autobuild/scripts
+      PERMISSIONS OWNER_READ OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+  else()
+    # For other platforms, install to bin directory
+    install(FILES "${_REPO_ROOT}/autobuild/scripts/autobuild.sh"
+      DESTINATION ${CMAKE_INSTALL_BINDIR}/autobuild/scripts
+      PERMISSIONS OWNER_READ OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+  endif()
 endif()

@@ -11,6 +11,11 @@
 #include <windows.h>
 #endif
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <unistd.h>
+#endif
+
 // Animation globals
 Mesh* g_spinning_cube = nullptr;
 GLuint g_shader_program = 0;
@@ -19,10 +24,18 @@ Uint32 g_last_frame_time = 0;
 bool g_animation_running = true;
 
 bool InitializeOpenGL(SDL_Window* window) {
-    // Set OpenGL attributes
+    // Set OpenGL attributes - use compatible versions for macOS
+#ifdef __APPLE__
+    // macOS supports OpenGL 4.1, but we'll try 3.3 first for better compatibility
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+#else
+    // Other platforms can use OpenGL 4.1
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     
@@ -30,7 +43,23 @@ bool InitializeOpenGL(SDL_Window* window) {
     SDL_GLContext gl_context = SDL_GL_CreateContext(window);
     if (!gl_context) {
         printf("Failed to create OpenGL context: %s\n", SDL_GetError());
+        
+#ifdef __APPLE__
+        // On macOS, try with OpenGL 2.1 as fallback
+        printf("Trying fallback OpenGL 2.1 context...\n");
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+        
+        gl_context = SDL_GL_CreateContext(window);
+        if (!gl_context) {
+            printf("Failed to create fallback OpenGL context: %s\n", SDL_GetError());
+            return false;
+        }
+        printf("Successfully created OpenGL 2.1 context\n");
+#else
         return false;
+#endif
     }
     
     // Initialize GLAD
@@ -86,6 +115,24 @@ bool InitializeOpenGL(SDL_Window* window) {
     }
     
     printf("Loading shaders: %s and %s\n", vertex_path, fragment_path);
+    
+    // Check if shader files exist
+    FILE* vertex_file = fopen(vertex_path, "r");
+    if (!vertex_file) {
+        printf("ERROR: Vertex shader file not found: %s\n", vertex_path);
+    } else {
+        fclose(vertex_file);
+        printf("Vertex shader file found: %s\n", vertex_path);
+    }
+    
+    FILE* fragment_file = fopen(fragment_path, "r");
+    if (!fragment_file) {
+        printf("ERROR: Fragment shader file not found: %s\n", fragment_path);
+    } else {
+        fclose(fragment_file);
+        printf("Fragment shader file found: %s\n", fragment_path);
+    }
+    
     g_shader_program = LoadShaders(vertex_path, fragment_path);
     if (g_shader_program == 0) {
         printf("Failed to load shaders\n");
@@ -94,6 +141,8 @@ bool InitializeOpenGL(SDL_Window* window) {
         SDL_GL_DeleteContext(gl_context);
         return false;
     }
+    
+    printf("Shaders loaded successfully\n");
     
     g_last_frame_time = SDL_GetTicks();
     printf("OpenGL animation initialized successfully\n");
@@ -165,17 +214,22 @@ void CleanupOpenGL() {
 }
 
 int main(int argc, char* argv[]) {
+    printf("Starting Autobuild OpenGL Animation...\n");
+    
     // Initialize SDL
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         printf("SDL failed initialization: %s\n", SDL_GetError());
         return -1;
     }
     
+    printf("SDL initialized successfully\n");
+    
     // Create window
     int screen_width = 800;
     int screen_height = 600;
     
-    SDL_Window* window = SDL_CreateWindow("", 
+    printf("Creating window (%dx%d)...\n", screen_width, screen_height);
+    SDL_Window* window = SDL_CreateWindow("Autobuild Animation", 
                                          SDL_WINDOWPOS_CENTERED, 
                                          SDL_WINDOWPOS_CENTERED, 
                                          screen_width, 
@@ -188,7 +242,10 @@ int main(int argc, char* argv[]) {
         return -1;
     }
     
+    printf("Window created successfully\n");
+    
     // Initialize OpenGL
+    printf("Initializing OpenGL...\n");
     if (!InitializeOpenGL(window)) {
         printf("Failed to initialize OpenGL animation\n");
         SDL_DestroyWindow(window);
@@ -196,9 +253,13 @@ int main(int argc, char* argv[]) {
         return -1;
     }
     
+    printf("OpenGL initialized successfully\n");
+    
     // Animation duration (3 seconds)
     Uint32 animation_start = SDL_GetTicks();
     Uint32 animation_duration = 3000; // 3 seconds
+    
+    printf("Starting animation loop (duration: %d ms)...\n", animation_duration);
     
     // Main animation loop
     while (g_animation_running) {
@@ -262,16 +323,47 @@ int main(int argc, char* argv[]) {
             printf("Failed to launch main application. Error: %lu\n", GetLastError());
         }
     #elif defined(__APPLE__)
-        // On macOS prefer LaunchServices if app bundle, else exec from PATH
-        // Try to open by bundle identifier if installed
-        int rc = system("open -b com.autobuild.main >/dev/null 2>&1");
-        if (rc != 0) {
-            // Fallback: try opening by executable name from PATH
-            rc = system("open -a autobuild_main >/dev/null 2>&1");
-        }
-        if (rc != 0) {
-            // Last resort: run from current directory/background
-            rc = system("./autobuild_main &");
+        // On macOS, find and launch the main application
+        printf("Launching main application on macOS...\n");
+        // First try to find the main app in the same directory as this animation
+        char exe_path[1024];
+        uint32_t size = sizeof(exe_path);
+        if (_NSGetExecutablePath(exe_path, &size) == 0) {
+            printf("Animation executable path: %s\n", exe_path);
+            // Get directory containing this executable
+            char* last_slash = strrchr(exe_path, '/');
+            if (last_slash) {
+                *last_slash = '\0';
+                std::string dir_path = exe_path;
+                
+                // Try to find autobuild_main in the same directory
+                std::string main_app_path = dir_path + "/autobuild_main";
+                printf("Looking for main app at: %s\n", main_app_path.c_str());
+                if (access(main_app_path.c_str(), X_OK) == 0) {
+                    // Found it, launch it
+                    printf("Found main app executable, launching...\n");
+                    std::string launch_cmd = "open \"" + main_app_path + "\"";
+                    printf("Launch command: %s\n", launch_cmd.c_str());
+                    system(launch_cmd.c_str());
+                } else {
+                    // Try as app bundle
+                    std::string bundle_path = dir_path + "/autobuild_main.app";
+                    printf("Looking for main app bundle at: %s\n", bundle_path.c_str());
+                    if (access(bundle_path.c_str(), F_OK) == 0) {
+                        printf("Found main app bundle, launching...\n");
+                        std::string launch_cmd = "open \"" + bundle_path + "\"";
+                        printf("Launch command: %s\n", launch_cmd.c_str());
+                        system(launch_cmd.c_str());
+                    } else {
+                        // Fallback: try system PATH
+                        printf("Main app not found locally, trying system PATH...\n");
+                        system("open -a autobuild_main >/dev/null 2>&1");
+                    }
+                }
+            }
+        } else {
+            // Fallback if we can't get executable path
+            system("open -a autobuild_main >/dev/null 2>&1");
         }
     #else
         // Linux/Unix: rely on PATH first, then local fallback
