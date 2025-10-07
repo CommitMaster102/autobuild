@@ -5887,7 +5887,7 @@ void RenderMainUI(AppState &state) {
       ImGui::BulletText("Feedback - Interactive development with Gemini Prompt 1 & 2");
       ImGui::BulletText("Verify - Reproduce customer command sequences");
       ImGui::BulletText("Both - Run feedback then verify back-to-back");
-      ImGui::BulletText("Audit - Analyze verify.sh and prompt for clarity");
+      ImGui::BulletText("Audit - Analyze verifier and prompt for clarity");
       ImGui::Spacing();
       ImGui::Separator();
       ImGui::Spacing();

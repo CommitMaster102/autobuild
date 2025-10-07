@@ -246,7 +246,7 @@ compose_audit_prompt_file() {
 
 Context (read-only):
 - _context/prompt.txt   = task
-- _context/verify.sh    = verifier
+- _context/verify/      = verifier (entire folder)
 - _context/Dockerfile   = environment contract (initial state)
 
 Working environment:
@@ -269,7 +269,7 @@ Constraints:
 - Treat Dockerfile-defined paths, names, and platform as environment invariants (valid hardcoding).
 - Do NOT invent requirements beyond prompt.txt or implied by the Dockerfile.
 - Do NOT suggest modifying or implementing anything; audit only.
-- Do NOT modify _context/prompt.txt, _context/verify.sh, or _context/Dockerfile.
+- Do NOT modify _context/prompt.txt, _context/verify/*, or _context/Dockerfile.
 - Keep each reason to 1–2 sentences.
 EOF
 }
@@ -284,33 +284,23 @@ copy_context_into_container() {
   # Resolve files (use existing helper)
   local prompt_path; prompt_path="$(get_prompt_path "$task_dir")"
   [ -f "$prompt_path" ] || die "Prompt file not found (resolved to: $prompt_path)"
+  [ -d "$verify_dir" ] || die "Missing $verify_dir directory"
   [ -f "$verify_dir/verify.sh" ] || die "Missing $verify_dir/verify.sh"
   [ -f "$env_dir/Dockerfile" ]  || die "Missing $env_dir/Dockerfile"
 
   log_info "Using PROMPT:     $prompt_path"
-  log_info "Using VERIFY.SH:  $verify_dir/verify.sh"
+  log_info "Using VERIFY DIR: $verify_dir"
   log_info "Using DOCKERFILE: $env_dir/Dockerfile"
 
-  docker exec -u root "$container_name" bash -lc "mkdir -p '$workdir/_context'"
+  docker exec -u root "$container_name" bash -lc "mkdir -p '$workdir/_context/verify'"
 
   local prompt_win="$(to_windows_path "$prompt_path")"
-  local verify_sh_win="$(to_windows_path "$verify_dir/verify.sh")"
+  local verify_dir_win="$(to_windows_path "$verify_dir")"
   local dockerfile_win="$(to_windows_path "$env_dir/Dockerfile")"
+  
   MSYS_NO_PATHCONV=1 docker cp "$prompt_win"      "$container_name:$workdir/_context/prompt.txt"
-  MSYS_NO_PATHCONV=1 docker cp "$verify_sh_win"   "$container_name:$workdir/_context/verify.sh"
+  MSYS_NO_PATHCONV=1 docker cp "$verify_dir_win/." "$container_name:$workdir/_context/verify/"
   MSYS_NO_PATHCONV=1 docker cp "$dockerfile_win"  "$container_name:$workdir/_context/Dockerfile"
-
-  # Also include any additional files in verify/ (excluding verify.sh and command)
-  for extra_file in "$verify_dir"/*; do
-    if [ -f "$extra_file" ]; then
-      extra_base="$(basename "$extra_file")"
-      if [ "$extra_base" != "verify.sh" ] && [ "$extra_base" != "command" ]; then
-        extra_win="$(to_windows_path "$extra_file")"
-        log_info "Including additional verify file: $extra_base"
-        MSYS_NO_PATHCONV=1 docker cp "$extra_win" "$container_name:$workdir/_context/$extra_base"
-      fi
-    fi
-  done
 }
 
 
