@@ -163,6 +163,92 @@ struct AnimationManager {
 // Global animation manager
 AnimationManager g_animation_manager;
 
+// Helper function to draw a spinning icon
+static void DrawSpinningIcon(const char* icon_text, float radius_scale = 1.0f) {
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImVec2 size = ImGui::CalcTextSize(icon_text);
+    float time = (float)ImGui::GetTime();
+    float angle = time * 2.0f; // Rotation speed (radians per second)
+    
+    // Save cursor position
+    ImVec2 center = ImVec2(pos.x + size.x * 0.5f, pos.y + size.y * 0.5f);
+    
+    // Rotate around center using custom rendering
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    
+    // Calculate rotated position
+    float cos_a = cosf(angle);
+    float sin_a = sinf(angle);
+    
+    // Push a rotation transformation by rendering the text manually with rotation
+    ImGui::SetCursorScreenPos(center);
+    
+    // We'll use a simpler approach: just render multiple dots in a circle
+    // This creates a spinner effect
+    const int num_dots = 8;
+    float dot_radius = size.x * 0.5f;
+    ImU32 color = ImGui::GetColorU32(ImGuiCol_Text);
+    
+    for (int i = 0; i < num_dots; i++) {
+        float a = (angle + (i * 2.0f * IM_PI / num_dots));
+        float alpha = 0.3f + 0.7f * ((float)(num_dots - i) / num_dots);
+        ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 1.0f, 1.0f, alpha));
+        ImVec2 dot_pos = ImVec2(
+            center.x + cosf(a) * dot_radius * 0.7f,
+            center.y + sinf(a) * dot_radius * 0.7f
+        );
+        draw_list->AddCircleFilled(dot_pos, 2.0f, col);
+    }
+    
+    // Restore cursor position
+    ImGui::SetCursorScreenPos(ImVec2(pos.x + size.x + 5.0f, pos.y));
+}
+
+// Helper function for resizable horizontal splitter
+static bool Splitter(const char* label, float* size1, float* size2, float min_size1, float min_size2, float splitter_height = 4.0f) {
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    ImGuiWindow* window = g.CurrentWindow;
+    ImGuiID id = window->GetID(label);
+    
+    ImRect bb;
+    bb.Min = window->DC.CursorPos;
+    bb.Max = ImVec2(bb.Min.x + ImGui::GetContentRegionAvail().x, bb.Min.y + splitter_height);
+    
+    ImGui::ItemSize(bb);
+    if (!ImGui::ItemAdd(bb, id)) {
+        return false;
+    }
+    
+    bool hovered, held;
+    bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held);
+    
+    if (held) {
+        float mouse_delta = ImGui::GetIO().MouseDelta.y;
+        float total_size = *size1 + *size2;
+        float new_size1 = *size1 + mouse_delta;
+        float new_size2 = *size2 - mouse_delta;
+        
+        // Apply constraints
+        if (new_size1 < min_size1) {
+            new_size1 = min_size1;
+            new_size2 = total_size - new_size1;
+        }
+        if (new_size2 < min_size2) {
+            new_size2 = min_size2;
+            new_size1 = total_size - new_size2;
+        }
+        
+        *size1 = new_size1;
+        *size2 = new_size2;
+    }
+    
+    // Visual feedback
+    ImU32 col = ImGui::GetColorU32(held ? ImGuiCol_ButtonActive : hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button);
+    ImGui::RenderFrame(bb.Min, bb.Max, col, false, 0.0f);
+    
+    return pressed;
+}
+
 // Compatibility: projects built without Docking support won't have this flag.
 // Define it to 0 so code using it compiles and has no effect.
 #ifndef ImGuiWindowFlags_NoDocking
@@ -1361,11 +1447,20 @@ struct AppState {
   std::vector<DockerImage> images;
   bool docker_loaded = false;
   bool docker_unavailable = false; // Set to true when Docker is not running/accessible
+  std::atomic<bool> docker_refreshing{false}; // Set to true when refresh is in progress
+  std::thread docker_refresh_thread; // Background thread for Docker refresh
+  std::mutex docker_state_mutex; // Protect docker containers and images from concurrent access
   // Manage Logs state
   int selected_task_index = -1;
   int selected_run_index = -1;
   bool show_confirm_delete = false;
   std::string pending_delete_path;
+
+  // History deletion confirmation popups
+  bool show_confirm_clear_all_history = false;
+  bool show_confirm_clear_prompt_all_history = false;
+  int pending_clear_prompt_index = -1;
+  bool skip_next_history_push = false; // Prevent auto-save from interfering with manual history operations
 
   // NEW: Multi-task support
   std::vector<std::shared_ptr<TaskInstance>> tasks;
@@ -1375,6 +1470,7 @@ struct AppState {
   int run_multiple_count =
       1; // How many tasks to run when "Run Multiple" is clicked
   bool use_docker_no_cache = true; // Always use --no-cache for Docker builds
+  bool use_docker_debug = false;   // Enable Docker build debug mode with verbose output
   int selected_task_tab = 0;       // Currently selected task tab in logs view
 
   // Developer diagnostics
@@ -1403,6 +1499,36 @@ struct AppState {
 
   // Docker error handling
   std::string image_delete_error;
+
+  // Prompt Editor state
+  bool show_prompt_editor = false;
+  std::string prompt1_original;
+  std::string prompt2_original;
+  std::string audit_prompt_original;
+  std::string prompt1_modified;
+  std::string prompt2_modified;
+  std::string audit_prompt_modified;
+  bool prompts_loaded = false;
+  bool prompts_modified = false;
+  int selected_prompt_tab = 0; // 0=Prompt1, 1=Prompt2, 2=Audit
+  bool show_diff_view = true;
+  bool diff_split_view = true; // true=split, false=unified
+  bool diff_wrap_lines = false; // Enable line wrapping in diff view
+  float diff_editor_splitter_height = 300.0f; // Height of diff view (resizable)
+  
+  // Undo/Redo history for each prompt separately
+  struct PromptHistory {
+    std::vector<std::string> history;
+    int current_index = -1;
+    int max_size = 50;
+  };
+  PromptHistory prompt1_history;
+  PromptHistory prompt2_history;
+  PromptHistory audit_prompt_history;
+  
+  // Debug tracking for change-based logging
+  int last_logged_prompt_tab = -1;
+  bool last_logged_editor_open = false;
 };
 
 const char *modes[] = {"Feedback", "Verify", "Both", "Audit"};
@@ -2233,6 +2359,99 @@ static bool RemoveDirectoryRecursive(const std::string &path) {
 
 // Config file management with JSON format
 // Get platform-specific config file path
+static std::string GetPromptsFilePath() {
+#ifdef _WIN32
+  char *appdata = getenv("LOCALAPPDATA");
+  if (appdata) {
+    std::string dir = std::string(appdata) + "\\Autobuild";
+    CreateDirectoryRecursive(dir);
+    return dir + "\\prompts.json";
+  }
+  return "prompts.json";
+#else
+  const char *home = getenv("HOME");
+  if (home) {
+    std::string dir = std::string(home) + "/.config/autobuild";
+    CreateDirectoryRecursive(dir);
+    return dir + "/prompts.json";
+  }
+  return "prompts.json";
+#endif
+}
+
+static void InitializeDefaultPrompts(AppState &state) {
+  if (state.prompts_loaded) {
+    return; // Already initialized
+  }
+  
+  DevLog(state, "InitializeDefaultPrompts: Setting default prompts");
+  
+  state.prompt1_original = R"(**Task:** 
+
+1.  Read the user request from the `prompt` file and execute the specified tasks. 
+2.  Use the `verify.sh` script to test your solution. 
+
+**Analysis of `verify.sh`:** 
+
+Upon completion of the task, provide a concise analysis of the `verify.sh` script's effectiveness. Your summary should address the following: 
+
+*   **Sufficiency:** Does the script contain adequate tests to confirm a successful task completion? 
+*   **Over-testing:** Does the script make rigid assumptions about the solution's implementation that might incorrectly fail a valid approach? 
+*   **Scope:** Does the script test for requirements not explicitly stated in `prompt`? 
+
+---
+Below is the content of prompt.txt for this task. Treat it as the user request:
+---)";
+
+  state.prompt2_original = R"(**Hypothetical Scenario:** 
+
+If the `verify.sh` script had not been provided, could you have successfully completed the task as defined in `prompt.txt`? 
+
+**Prompt and Verification Analysis:** 
+
+Identify any ambiguities or under-specified elements in either the `prompt.txt` or the `verify.sh` script that could have led to a failed test.)";
+
+  state.audit_prompt_original = R"(# Minimal Audit Prompt (for Gemini CLI)
+
+Context (read-only):
+- _context/prompt.txt   = task
+- _context/verify/      = verifier (entire folder)
+- _context/Dockerfile   = environment contract (initial state)
+
+Working environment:
+- You are executing inside the environment created by the Dockerfile.
+- All files/subfolders in the current working directory (except `_context/`) are the live environment.
+- `_context/` is reference-only and read-only.
+
+Task:
+Analyze only. Determine if the verifier is valid for the task, if the task is clear enough to verify, and whether the verifier would also accept other valid implementations (within constraints). Do not implement or propose fixes.
+
+Output in EXACTLY this format:
+<VERIFY_VALID>Yes/No</VERIFY_VALID>
+<VERIFY_REASON>[1–2 sentences. Explicitly address: behavior vs implementation, over-constraint vs prompt/Dockerfile invariants, environment/path assumptions, functional coverage, hardcoded/irrelevant data, and prompt–verify alignment.]</VERIFY_REASON>
+<PROMPT_CLEAR>Yes/No</PROMPT_CLEAR>
+<PROMPT_REASON>[1–2 sentences on whether the task is clear enough to verify and why.]</PROMPT_REASON>
+<OTHER_VALID_SOLUTIONS_OK>Yes/No</OTHER_VALID_SOLUTIONS_OK>
+<OTHER_SOLUTIONS_REASON>[1–2 sentences on whether the verifier would pass other valid solutions under the constraints and why.]</OTHER_SOLUTIONS_REASON>
+
+Constraints:
+- Treat Dockerfile-defined paths, names, and platform as environment invariants (valid hardcoding).
+- Do NOT invent requirements beyond prompt.txt or implied by the Dockerfile.
+- Do NOT suggest modifying or implementing anything; audit only.
+- Do NOT modify _context/prompt.txt, _context/verify/*, or _context/Dockerfile.
+- Keep each reason to 1–2 sentences.)";
+
+  state.prompt1_modified = state.prompt1_original;
+  state.prompt2_modified = state.prompt2_original;
+  state.audit_prompt_modified = state.audit_prompt_original;
+  state.prompts_loaded = true;
+  state.prompts_modified = false;
+  
+  DevLog(state, "InitializeDefaultPrompts: Prompt1 length=" + std::to_string(state.prompt1_original.length()));
+  DevLog(state, "InitializeDefaultPrompts: Prompt2 length=" + std::to_string(state.prompt2_original.length()));
+  DevLog(state, "InitializeDefaultPrompts: Audit length=" + std::to_string(state.audit_prompt_original.length()));
+}
+
 static std::string GetConfigFilePath() {
   std::string exe_dir = GetExecutableDir();
   
@@ -2358,6 +2577,8 @@ void SaveConfig(const AppState &state) {
          << ",\n";
     file << "  \"use_docker_no_cache\": "
          << (state.use_docker_no_cache ? "true" : "false") << ",\n";
+    file << "  \"use_docker_debug\": "
+         << (state.use_docker_debug ? "true" : "false") << ",\n";
     file << "  \"feedback_count\": " << state.feedback_count << ",\n";
     file << "  \"verify_count\": " << state.verify_count << ",\n";
     file << "  \"both_count\": " << state.both_count << ",\n";
@@ -2365,6 +2586,248 @@ void SaveConfig(const AppState &state) {
     file << "}\n";
     file.close();
   }
+}
+
+void SavePrompts(const AppState &state) {
+  std::string prompts_path = GetPromptsFilePath();
+  DevLog(const_cast<AppState&>(state), "Saving prompts to: " + prompts_path);
+  
+  // Create directory if it doesn't exist
+  size_t last_slash = prompts_path.find_last_of("/\\");
+  if (last_slash != std::string::npos) {
+    std::string dir = prompts_path.substr(0, last_slash);
+    CreateDirectoryRecursive(dir);
+  }
+  
+  std::ofstream file(prompts_path);
+  if (!file.is_open()) {
+    DevLog(const_cast<AppState&>(state), "ERROR: Failed to open prompts file for writing: " + prompts_path);
+    return;
+  }
+  
+  file << "{\n";
+  file << "  \"prompt1\": \"" << JsonEscape(state.prompt1_modified) << "\",\n";
+  file << "  \"prompt2\": \"" << JsonEscape(state.prompt2_modified) << "\",\n";
+  file << "  \"audit_prompt\": \"" << JsonEscape(state.audit_prompt_modified) << "\",\n";
+  
+  // Save history stacks
+  file << "  \"prompt1_history\": [";
+  for (size_t i = 0; i < state.prompt1_history.history.size(); i++) {
+    if (i > 0) file << ", ";
+    file << "\"" << JsonEscape(state.prompt1_history.history[i]) << "\"";
+  }
+  file << "],\n";
+  file << "  \"prompt1_history_index\": " << state.prompt1_history.current_index << ",\n";
+  
+  file << "  \"prompt2_history\": [";
+  for (size_t i = 0; i < state.prompt2_history.history.size(); i++) {
+    if (i > 0) file << ", ";
+    file << "\"" << JsonEscape(state.prompt2_history.history[i]) << "\"";
+  }
+  file << "],\n";
+  file << "  \"prompt2_history_index\": " << state.prompt2_history.current_index << ",\n";
+  
+  file << "  \"audit_history\": [";
+  for (size_t i = 0; i < state.audit_prompt_history.history.size(); i++) {
+    if (i > 0) file << ", ";
+    file << "\"" << JsonEscape(state.audit_prompt_history.history[i]) << "\"";
+  }
+  file << "],\n";
+  file << "  \"audit_history_index\": " << state.audit_prompt_history.current_index << "\n";
+  
+  file << "}\n";
+  
+  file.close();
+  
+  // Verify file was written
+  std::ifstream verify(prompts_path);
+  if (verify.is_open()) {
+    verify.seekg(0, std::ios::end);
+    size_t file_size = verify.tellg();
+    verify.close();
+    DevLog(const_cast<AppState&>(state), "Prompts saved successfully (file size: " + std::to_string(file_size) + " bytes)");
+  } else {
+    DevLog(const_cast<AppState&>(state), "ERROR: Could not verify saved file");
+  }
+}
+
+void LoadPrompts(AppState &state) {
+  if (!state.prompts_loaded) {
+    InitializeDefaultPrompts(state);
+  }
+  
+  std::string prompts_path = GetPromptsFilePath();
+  DevLog(state, "Loading prompts from: " + prompts_path);
+  
+  std::ifstream file(prompts_path);
+  if (!file.is_open()) {
+    DevLog(state, "Prompts file not found, using defaults: " + prompts_path);
+    return;
+  }
+  
+  // Read entire file into a string
+  std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  file.close();
+  
+  // Simple JSON parsing for each key
+  auto extractValue = [&content](const std::string &key) -> std::string {
+    std::string search = "\"" + key + "\": \"";
+    size_t start = content.find(search);
+    if (start == std::string::npos) {
+      return "";
+    }
+    start += search.length();
+    
+    // Find the closing quote, handling escaped quotes
+    size_t end = start;
+    while (end < content.length()) {
+      if (content[end] == '\"' && (end == 0 || content[end - 1] != '\\')) {
+        break;
+      }
+      end++;
+    }
+    
+    if (end >= content.length()) {
+      return "";
+    }
+    
+    std::string escaped_value = content.substr(start, end - start);
+    return JsonUnescape(escaped_value);
+  };
+  
+  auto extractInt = [&content](const std::string &key) -> int {
+    std::string search = "\"" + key + "\": ";
+    size_t start = content.find(search);
+    if (start == std::string::npos) {
+      return -1;
+    }
+    start += search.length();
+    
+    size_t end = start;
+    while (end < content.length() && (std::isdigit(content[end]) || content[end] == '-')) {
+      end++;
+    }
+    
+    if (end == start) return -1;
+    
+    try {
+      return std::stoi(content.substr(start, end - start));
+    } catch (...) {
+      return -1;
+    }
+  };
+  
+  auto extractArray = [&content](const std::string &key) -> std::vector<std::string> {
+    std::vector<std::string> result;
+    std::string search = "\"" + key + "\": [";
+    size_t start = content.find(search);
+    if (start == std::string::npos) {
+      return result;
+    }
+    start += search.length();
+    
+    size_t end = content.find(']', start);
+    if (end == std::string::npos) {
+      return result;
+    }
+    
+    std::string array_content = content.substr(start, end - start);
+    size_t pos = 0;
+    
+    while (pos < array_content.length()) {
+      // Find opening quote
+      size_t quote_start = array_content.find('\"', pos);
+      if (quote_start == std::string::npos) break;
+      quote_start++;
+      
+      // Find closing quote, handling escapes
+      size_t quote_end = quote_start;
+      while (quote_end < array_content.length()) {
+        if (array_content[quote_end] == '\"' && (quote_end == 0 || array_content[quote_end - 1] != '\\')) {
+          break;
+        }
+        quote_end++;
+      }
+      
+      if (quote_end >= array_content.length()) break;
+      
+      std::string value = array_content.substr(quote_start, quote_end - quote_start);
+      result.push_back(JsonUnescape(value));
+      pos = quote_end + 1;
+    }
+    
+    return result;
+  };
+  
+  std::string loaded_prompt1 = extractValue("prompt1");
+  std::string loaded_prompt2 = extractValue("prompt2");
+  std::string loaded_audit = extractValue("audit_prompt");
+  
+  // Only update if values were found
+  if (!loaded_prompt1.empty()) {
+    state.prompt1_modified = loaded_prompt1;
+    DevLog(state, "  Loaded Prompt1, length=" + std::to_string(loaded_prompt1.length()));
+  }
+  if (!loaded_prompt2.empty()) {
+    state.prompt2_modified = loaded_prompt2;
+    DevLog(state, "  Loaded Prompt2, length=" + std::to_string(loaded_prompt2.length()));
+  }
+  if (!loaded_audit.empty()) {
+    state.audit_prompt_modified = loaded_audit;
+    DevLog(state, "  Loaded Audit, length=" + std::to_string(loaded_audit.length()));
+  }
+  
+  // Load history stacks
+  auto loadHistory = [&](AppState::PromptHistory &history, const std::string &array_key, const std::string &index_key, const std::string &name) {
+    std::vector<std::string> history_data = extractArray(array_key);
+    int history_index = extractInt(index_key);
+    
+    if (!history_data.empty() && history_index >= 0) {
+      history.history = history_data;
+      history.current_index = std::min(history_index, (int)history_data.size() - 1);
+      DevLog(state, "  Loaded " + name + " history: " + std::to_string(history.history.size()) + 
+        " entries, index=" + std::to_string(history.current_index));
+    }
+  };
+  
+  loadHistory(state.prompt1_history, "prompt1_history", "prompt1_history_index", "Prompt1");
+  loadHistory(state.prompt2_history, "prompt2_history", "prompt2_history_index", "Prompt2");
+  loadHistory(state.audit_prompt_history, "audit_history", "audit_history_index", "Audit");
+  
+  // Validate history consistency
+  if (!state.prompt1_history.history.empty() && state.prompt1_history.current_index >= 0 &&
+      state.prompt1_history.current_index < (int)state.prompt1_history.history.size()) {
+    if (state.prompt1_history.history[state.prompt1_history.current_index] != state.prompt1_modified) {
+      DevLog(state, "  WARNING: Prompt1 history inconsistent, resetting");
+      state.prompt1_history.history.clear();
+      state.prompt1_history.current_index = -1;
+    }
+  }
+  
+  if (!state.prompt2_history.history.empty() && state.prompt2_history.current_index >= 0 &&
+      state.prompt2_history.current_index < (int)state.prompt2_history.history.size()) {
+    if (state.prompt2_history.history[state.prompt2_history.current_index] != state.prompt2_modified) {
+      DevLog(state, "  WARNING: Prompt2 history inconsistent, resetting");
+      state.prompt2_history.history.clear();
+      state.prompt2_history.current_index = -1;
+    }
+  }
+  
+  if (!state.audit_prompt_history.history.empty() && state.audit_prompt_history.current_index >= 0 &&
+      state.audit_prompt_history.current_index < (int)state.audit_prompt_history.history.size()) {
+    if (state.audit_prompt_history.history[state.audit_prompt_history.current_index] != state.audit_prompt_modified) {
+      DevLog(state, "  WARNING: Audit history inconsistent, resetting");
+      state.audit_prompt_history.history.clear();
+      state.audit_prompt_history.current_index = -1;
+    }
+  }
+  
+  // Check if modified prompts differ from originals
+  state.prompts_modified = (state.prompt1_modified != state.prompt1_original) ||
+                           (state.prompt2_modified != state.prompt2_original) ||
+                           (state.audit_prompt_modified != state.audit_prompt_original);
+  
+  DevLog(state, "Prompts loaded successfully. Modified: " + std::string(state.prompts_modified ? "Yes" : "No"));
 }
 
 void LoadConfig(AppState &state) {
@@ -2449,13 +2912,16 @@ void LoadConfig(AppState &state) {
               state.audit_count = 1;
           }
         } else if (key == "auto_lowercase_names" ||
-                   key == "use_docker_no_cache") {
+                   key == "use_docker_no_cache" ||
+                   key == "use_docker_debug") {
           // Extract boolean value
           bool bool_value = (line.find("true") != std::string::npos);
           if (key == "auto_lowercase_names") {
             state.auto_lowercase_names = bool_value;
           } else if (key == "use_docker_no_cache") {
             state.use_docker_no_cache = bool_value;
+          } else if (key == "use_docker_debug") {
+            state.use_docker_debug = bool_value;
           }
         } else {
           // Extract string value
@@ -3877,9 +4343,12 @@ static std::string GuessLogPathForContainer(const AppState &state,
 }
 
 static void RefreshDockerState(AppState &state) {
-  state.containers.clear();
-  state.images.clear();
-  state.docker_unavailable = false;
+  // Build temporary containers/images WITHOUT holding the lock
+  // This prevents UI freezing while Docker commands run
+  std::vector<AppState::DockerContainer> temp_containers;
+  std::vector<AppState::DockerImage> temp_images;
+  bool temp_unavailable = false;
+  bool temp_loaded = false;
   
   // Check if Docker is available by running a simple ping command
   auto ping_result = RunShellLines("docker info 2>&1");
@@ -3891,8 +4360,16 @@ static void RefreshDockerState(AppState &state) {
         ln.find("Is the docker daemon running") != std::string::npos ||
         ln.find("no puede encontrar") != std::string::npos ||  // Spanish: "cannot find"
         ln.find("El sistema no puede encontrar") != std::string::npos) {
-      state.docker_unavailable = true;
-      state.docker_loaded = true;
+      temp_unavailable = true;
+      temp_loaded = true;
+      // Update state quickly with lock
+      {
+        std::lock_guard<std::mutex> lock(state.docker_state_mutex);
+        state.containers.clear();
+        state.images.clear();
+        state.docker_unavailable = temp_unavailable;
+        state.docker_loaded = temp_loaded;
+      }
       return;
     }
     // If we see valid Docker info output, it's available
@@ -3904,11 +4381,20 @@ static void RefreshDockerState(AppState &state) {
   
   // If Docker ping failed completely, mark as unavailable
   if (!docker_available && !ping_result.empty()) {
-    state.docker_unavailable = true;
-    state.docker_loaded = true;
+    temp_unavailable = true;
+    temp_loaded = true;
+    // Update state quickly with lock
+    {
+      std::lock_guard<std::mutex> lock(state.docker_state_mutex);
+      state.containers.clear();
+      state.images.clear();
+      state.docker_unavailable = temp_unavailable;
+      state.docker_loaded = temp_loaded;
+    }
     return;
   }
   
+  // Get containers list (slow operation, no lock held)
   auto cl = RunShellLines(
       "docker ps -a --format "
       "'{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.CreatedAt}}'");
@@ -3933,8 +4419,10 @@ static void RefreshDockerState(AppState &state) {
     dc.status = status;
     dc.created = created;
     dc.log_path = GuessLogPathForContainer(state, name);
-    state.containers.push_back(dc);
+    temp_containers.push_back(dc);
   }
+  
+  // Get images list (slow operation, no lock held)
   auto il = RunShellLines(
       "docker images --format '{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}'");
   for (const auto &ln : il) {
@@ -3949,9 +4437,37 @@ static void RefreshDockerState(AppState &state) {
     std::getline(ss, repo, '\t');
     std::getline(ss, id, '\t');
     std::getline(ss, size, '\t');
-    state.images.push_back(AppState::DockerImage{repo, id, size});
+    temp_images.push_back(AppState::DockerImage{repo, id, size});
   }
-  state.docker_loaded = true;
+  
+  // Now update the state with a very brief lock
+  {
+    std::lock_guard<std::mutex> lock(state.docker_state_mutex);
+    state.containers = std::move(temp_containers);
+    state.images = std::move(temp_images);
+    state.docker_unavailable = false;
+    state.docker_loaded = true;
+  }
+}
+
+// Asynchronously refresh Docker state in background thread
+static void RefreshDockerStateAsync(AppState &state) {
+  // If already refreshing, don't start another refresh
+  if (state.docker_refreshing.load()) {
+    return;
+  }
+  
+  // Join previous thread if it exists
+  if (state.docker_refresh_thread.joinable()) {
+    state.docker_refresh_thread.join();
+  }
+  
+  // Start new refresh thread
+  state.docker_refreshing.store(true);
+  state.docker_refresh_thread = std::thread([&state]() {
+    RefreshDockerState(state);
+    state.docker_refreshing.store(false);
+  });
 }
 
 static void OpenFolderExternal(const std::string &path) {
@@ -4042,6 +4558,11 @@ std::string BuildCommand(const AppState &state,
   // NEW: Add --no-cache flag if enabled
   if (state.use_docker_no_cache) {
     args += " --no-cache";
+  }
+
+  // Add --debug flag if enabled
+  if (state.use_docker_debug) {
+    args += " --debug";
   }
 
   if (!state.image_tag.empty()) {
@@ -4351,6 +4872,1091 @@ std::string BuildCommand(const AppState &state,
 #endif
 
  return cmd;
+}
+
+static bool IsPromptValid(const std::string &prompt) {
+  // Check if prompt is not empty and contains non-whitespace characters
+  if (prompt.empty()) {
+    return false;
+  }
+  
+  for (char c : prompt) {
+    if (!std::isspace(static_cast<unsigned char>(c))) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+// Character-level diff highlighting helper
+struct CharDiff {
+  std::string text;
+  bool is_changed;
+};
+
+static std::vector<CharDiff> ComputeCharDiff(const std::string &old_str, const std::string &new_str, bool for_new_string = false) {
+  std::vector<CharDiff> result;
+  
+  // Simple character-level diff - find common prefix and suffix
+  size_t common_prefix = 0;
+  while (common_prefix < old_str.length() && common_prefix < new_str.length() && 
+         old_str[common_prefix] == new_str[common_prefix]) {
+    common_prefix++;
+  }
+  
+  size_t common_suffix = 0;
+  while (common_suffix < (old_str.length() - common_prefix) && 
+         common_suffix < (new_str.length() - common_prefix) && 
+         old_str[old_str.length() - 1 - common_suffix] == new_str[new_str.length() - 1 - common_suffix]) {
+    common_suffix++;
+  }
+  
+  const std::string &target_str = for_new_string ? new_str : old_str;
+  
+  // Add common prefix (unchanged)
+  if (common_prefix > 0) {
+    result.push_back({target_str.substr(0, common_prefix), false});
+  }
+  
+  // Add middle part (changed)
+  size_t mid_start = common_prefix;
+  size_t mid_end = target_str.length() - common_suffix;
+  if (mid_start < mid_end) {
+    result.push_back({target_str.substr(mid_start, mid_end - mid_start), true});
+  }
+  
+  // Add common suffix (unchanged)
+  if (common_suffix > 0) {
+    result.push_back({target_str.substr(target_str.length() - common_suffix), false});
+  }
+  
+  return result;
+}
+
+// Per-prompt history management functions
+static void PushToHistory(AppState::PromptHistory &history, const std::string &value) {
+  // Remove any redo history when making a new change
+  if (history.current_index < (int)history.history.size() - 1) {
+    history.history.erase(
+      history.history.begin() + history.current_index + 1,
+      history.history.end()
+    );
+  }
+  
+  // Add current state to history
+  history.history.push_back(value);
+  history.current_index++;
+  
+  // Limit history size
+  if (history.history.size() > (size_t)history.max_size) {
+    history.history.erase(history.history.begin());
+    history.current_index--;
+  }
+}
+
+static bool CanUndoPrompt(const AppState::PromptHistory &history) {
+  return history.current_index > 0;
+}
+
+static bool CanRedoPrompt(const AppState::PromptHistory &history) {
+  return history.current_index < (int)history.history.size() - 1;
+}
+
+static void UndoPrompt(AppState &state, int prompt_index) {
+  AppState::PromptHistory *history = nullptr;
+  std::string *modified_prompt = nullptr;
+  
+  if (prompt_index == 0) {
+    history = &state.prompt1_history;
+    modified_prompt = &state.prompt1_modified;
+  } else if (prompt_index == 1) {
+    history = &state.prompt2_history;
+    modified_prompt = &state.prompt2_modified;
+  } else if (prompt_index == 2) {
+    history = &state.audit_prompt_history;
+    modified_prompt = &state.audit_prompt_modified;
+  }
+  
+  if (!history || !CanUndoPrompt(*history)) return;
+  
+  history->current_index--;
+  *modified_prompt = history->history[history->current_index];
+  
+  state.prompts_modified = (state.prompt1_modified != state.prompt1_original) ||
+                           (state.prompt2_modified != state.prompt2_original) ||
+                           (state.audit_prompt_modified != state.audit_prompt_original);
+  
+  DevLog(state, "Undo Prompt " + std::to_string(prompt_index) + ": index=" + std::to_string(history->current_index));
+}
+
+static void RedoPrompt(AppState &state, int prompt_index) {
+  AppState::PromptHistory *history = nullptr;
+  std::string *modified_prompt = nullptr;
+  
+  if (prompt_index == 0) {
+    history = &state.prompt1_history;
+    modified_prompt = &state.prompt1_modified;
+  } else if (prompt_index == 1) {
+    history = &state.prompt2_history;
+    modified_prompt = &state.prompt2_modified;
+  } else if (prompt_index == 2) {
+    history = &state.audit_prompt_history;
+    modified_prompt = &state.audit_prompt_modified;
+  }
+  
+  if (!history || !CanRedoPrompt(*history)) return;
+  
+  history->current_index++;
+  *modified_prompt = history->history[history->current_index];
+  
+  state.prompts_modified = (state.prompt1_modified != state.prompt1_original) ||
+                           (state.prompt2_modified != state.prompt2_original) ||
+                           (state.audit_prompt_modified != state.audit_prompt_original);
+  
+  DevLog(state, "Redo Prompt " + std::to_string(prompt_index) + ": index=" + std::to_string(history->current_index));
+}
+
+static void InitializePromptHistory(AppState &state) {
+  if (state.prompt1_history.history.empty()) {
+    PushToHistory(state.prompt1_history, state.prompt1_modified);
+    DevLog(state, "Initialized Prompt1 history");
+  }
+  if (state.prompt2_history.history.empty()) {
+    PushToHistory(state.prompt2_history, state.prompt2_modified);
+    DevLog(state, "Initialized Prompt2 history");
+  }
+  if (state.audit_prompt_history.history.empty()) {
+    PushToHistory(state.audit_prompt_history, state.audit_prompt_modified);
+    DevLog(state, "Initialized Audit history");
+  }
+}
+
+static void ClearCurrentPromptState(AppState &state, int prompt_index) {
+  AppState::PromptHistory *history = nullptr;
+  const char *name = "";
+  
+  if (prompt_index == 0) {
+    history = &state.prompt1_history;
+    name = "Prompt1";
+  } else if (prompt_index == 1) {
+    history = &state.prompt2_history;
+    name = "Prompt2";
+  } else if (prompt_index == 2) {
+    history = &state.audit_prompt_history;
+    name = "Audit";
+  }
+  
+  if (history && history->history.size() > 1) {
+    // Set flag to prevent auto-save from interfering
+    state.skip_next_history_push = true;
+    
+    // Remove current state and go back to previous
+    history->history.pop_back();
+    history->current_index--;
+    
+    // Update the current prompt to the previous state
+    if (history->current_index >= 0 && history->current_index < (int)history->history.size()) {
+      if (prompt_index == 0) {
+        state.prompt1_modified = history->history[history->current_index];
+      } else if (prompt_index == 1) {
+        state.prompt2_modified = history->history[history->current_index];
+      } else if (prompt_index == 2) {
+        state.audit_prompt_modified = history->history[history->current_index];
+      }
+    }
+    
+    // Update the modified flag
+    state.prompts_modified = (state.prompt1_modified != state.prompt1_original) ||
+                             (state.prompt2_modified != state.prompt2_original) ||
+                             (state.audit_prompt_modified != state.audit_prompt_original);
+    
+    DevLog(state, std::string("Cleared current state from ") + name + " history");
+  }
+}
+
+static void ClearAllPromptHistory(AppState &state, int prompt_index) {
+  AppState::PromptHistory *history = nullptr;
+  const char *name = "";
+  
+  if (prompt_index == 0) {
+    history = &state.prompt1_history;
+    name = "Prompt1";
+  } else if (prompt_index == 1) {
+    history = &state.prompt2_history;
+    name = "Prompt2";
+  } else if (prompt_index == 2) {
+    history = &state.audit_prompt_history;
+    name = "Audit";
+  }
+  
+  if (history) {
+    history->history.clear();
+    history->current_index = -1;
+    // Reset to original state
+    if (prompt_index == 0) {
+      state.prompt1_modified = state.prompt1_original;
+    } else if (prompt_index == 1) {
+      state.prompt2_modified = state.prompt2_original;
+    } else if (prompt_index == 2) {
+      state.audit_prompt_modified = state.audit_prompt_original;
+    }
+    
+    // Update the modified flag
+    state.prompts_modified = (state.prompt1_modified != state.prompt1_original) ||
+                             (state.prompt2_modified != state.prompt2_original) ||
+                             (state.audit_prompt_modified != state.audit_prompt_original);
+    
+    // Re-initialize with original state
+    const std::string *original_value = nullptr;
+    if (prompt_index == 0) original_value = &state.prompt1_original;
+    else if (prompt_index == 1) original_value = &state.prompt2_original;
+    else if (prompt_index == 2) original_value = &state.audit_prompt_original;
+    
+    if (original_value) {
+      PushToHistory(*history, *original_value);
+    }
+    
+    DevLog(state, std::string("Cleared all ") + name + " history");
+  }
+}
+
+static void ClearAllHistory(AppState &state) {
+  DevLog(state, "Clearing all prompt history");
+  
+  // Reset all prompts to original state
+  state.prompt1_modified = state.prompt1_original;
+  state.prompt2_modified = state.prompt2_original;
+  state.audit_prompt_modified = state.audit_prompt_original;
+  
+  // Update the modified flag (should be false now since all are original)
+  state.prompts_modified = (state.prompt1_modified != state.prompt1_original) ||
+                           (state.prompt2_modified != state.prompt2_original) ||
+                           (state.audit_prompt_modified != state.audit_prompt_original);
+  
+  // Clear all history and re-initialize with original states
+  state.prompt1_history.history.clear();
+  state.prompt1_history.current_index = -1;
+  PushToHistory(state.prompt1_history, state.prompt1_original);
+  
+  state.prompt2_history.history.clear();
+  state.prompt2_history.current_index = -1;
+  PushToHistory(state.prompt2_history, state.prompt2_original);
+  
+  state.audit_prompt_history.history.clear();
+  state.audit_prompt_history.current_index = -1;
+  PushToHistory(state.audit_prompt_history, state.audit_prompt_original);
+  
+  SavePrompts(state);
+}
+
+void RenderDiffView(AppState &state, const std::string &original, const std::string &modified, int prompt_index = -1) {
+  // Toolbar with view controls
+  if (ImGui::Button(state.diff_split_view ? "Unified View" : "Split View")) {
+    state.diff_split_view = !state.diff_split_view;
+  }
+  ImGui::SameLine();
+  if (ImGui::Checkbox("Wrap Lines", &state.diff_wrap_lines)) {
+    // Toggle handled by checkbox
+  }
+  
+  // Add undo/redo/clear buttons with Font Awesome icons if prompt_index is provided
+  if (prompt_index >= 0) {
+    const AppState::PromptHistory *history = nullptr;
+    if (prompt_index == 0) history = &state.prompt1_history;
+    else if (prompt_index == 1) history = &state.prompt2_history;
+    else if (prompt_index == 2) history = &state.audit_prompt_history;
+    
+    if (history) {
+      // Push buttons to the right (4 buttons now: undo, redo, clear current, clear all)
+      float button_width = 30.0f;
+      float available_width = ImGui::GetContentRegionAvail().x;
+      ImGui::SameLine(available_width - (button_width * 4 + ImGui::GetStyle().ItemSpacing.x * 3));
+      
+      // Undo button with Font Awesome icon
+      {
+        ImGuiDisabledScope disable_undo(!CanUndoPrompt(*history));
+        if (ImGui::Button(ICON_FA_ROTATE_LEFT, ImVec2(button_width, 0))) {
+          DevLog(state, "Undo button clicked for prompt " + std::to_string(prompt_index));
+          UndoPrompt(state, prompt_index);
+        }
+      }
+      if (!CanUndoPrompt(*history) && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("No changes to undo");
+      } else if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Undo (Ctrl+Z)");
+      }
+      
+      // Redo button with Font Awesome icon
+      ImGui::SameLine();
+      {
+        ImGuiDisabledScope disable_redo(!CanRedoPrompt(*history));
+        if (ImGui::Button(ICON_FA_ROTATE_RIGHT, ImVec2(button_width, 0))) {
+          DevLog(state, "Redo button clicked for prompt " + std::to_string(prompt_index));
+          RedoPrompt(state, prompt_index);
+        }
+      }
+      if (!CanRedoPrompt(*history) && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("No changes to redo");
+      } else if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Redo (Ctrl+Y)");
+      }
+      
+      // Clear Current State button with Font Awesome icon
+      ImGui::SameLine();
+      {
+        bool has_history = history->history.size() > 1; // More than just current state
+        ImGuiDisabledScope disable_clear(!has_history);
+        if (ImGui::Button(ICON_FA_MINUS, ImVec2(button_width, 0))) {
+          DevLog(state, "Clear current state button clicked for prompt " + std::to_string(prompt_index));
+          ClearCurrentPromptState(state, prompt_index);
+          SavePrompts(state);
+        }
+      }
+      if (history->history.size() <= 1 && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("No current state to clear");
+      } else if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Clear current state (go back one step)");
+      }
+      
+      // Clear All History for this prompt button with Font Awesome icon
+      ImGui::SameLine();
+      {
+        bool has_history = history->history.size() > 1; // More than just current state
+        ImGuiDisabledScope disable_clear(!has_history);
+        if (ImGui::Button(ICON_FA_TRASH, ImVec2(button_width, 0))) {
+          DevLog(state, "Clear all history button clicked for prompt " + std::to_string(prompt_index));
+          state.pending_clear_prompt_index = prompt_index;
+          state.show_confirm_clear_prompt_all_history = true;
+        }
+      }
+      if (history->history.size() <= 1 && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("No history to clear");
+      } else if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Clear all history for this prompt (reset to original)");
+      }
+    }
+  }
+  
+  ImGui::Separator();
+  
+  std::vector<std::string> original_lines;
+  std::vector<std::string> modified_lines;
+  
+  auto trimEnd = [](std::string str) -> std::string {
+    size_t end = str.find_last_not_of(" \t\r\n");
+    return (end == std::string::npos) ? "" : str.substr(0, end + 1);
+  };
+  
+  {
+    std::istringstream orig_stream(original);
+    std::string line;
+    while (std::getline(orig_stream, line)) {
+      original_lines.push_back(trimEnd(line));
+    }
+  }
+  
+  {
+    std::istringstream mod_stream(modified);
+    std::string line;
+    while (std::getline(mod_stream, line)) {
+      modified_lines.push_back(trimEnd(line));
+    }
+  }
+  
+  struct DiffLine {
+    enum Type { UNCHANGED, ADDED, REMOVED, MODIFIED } type;
+    std::string orig_text;
+    std::string mod_text;
+    int orig_line_num;
+    int mod_line_num;
+  };
+  
+  std::vector<DiffLine> diff_result;
+  
+  size_t o = 0, m = 0;
+  int orig_line_num = 1, mod_line_num = 1;
+  
+  while (o < original_lines.size() || m < modified_lines.size()) {
+    if (o >= original_lines.size()) {
+      diff_result.push_back({DiffLine::ADDED, "", modified_lines[m], -1, mod_line_num++});
+      m++;
+    } else if (m >= modified_lines.size()) {
+      diff_result.push_back({DiffLine::REMOVED, original_lines[o], "", orig_line_num++, -1});
+      o++;
+    } else if (original_lines[o] == modified_lines[m]) {
+      diff_result.push_back({DiffLine::UNCHANGED, original_lines[o], modified_lines[m], orig_line_num++, mod_line_num++});
+      o++;
+      m++;
+    } else {
+      bool found_match = false;
+      
+      for (size_t look = m + 1; look < std::min(m + 5, modified_lines.size()); look++) {
+        if (original_lines[o] == modified_lines[look]) {
+          for (size_t add = m; add < look; add++) {
+            diff_result.push_back({DiffLine::ADDED, "", modified_lines[add], -1, mod_line_num++});
+          }
+          m = look;
+          found_match = true;
+          break;
+        }
+      }
+      
+      if (!found_match) {
+        for (size_t look = o + 1; look < std::min(o + 5, original_lines.size()); look++) {
+          if (modified_lines[m] == original_lines[look]) {
+            for (size_t rem = o; rem < look; rem++) {
+              diff_result.push_back({DiffLine::REMOVED, original_lines[rem], "", orig_line_num++, -1});
+            }
+            o = look;
+            found_match = true;
+            break;
+          }
+        }
+      }
+      
+      if (!found_match) {
+        diff_result.push_back({DiffLine::MODIFIED, original_lines[o], modified_lines[m], orig_line_num++, mod_line_num++});
+        o++;
+        m++;
+      }
+    }
+  }
+  
+  // Improved color scheme
+  ImVec4 color_added_bg = ImVec4(0.15f, 0.30f, 0.18f, 0.45f);
+  ImVec4 color_added_text = ImVec4(0.40f, 0.90f, 0.50f, 1.0f);
+  ImVec4 color_added_hl = ImVec4(0.20f, 0.45f, 0.25f, 0.65f);
+  ImVec4 color_removed_bg = ImVec4(0.40f, 0.15f, 0.15f, 0.45f);
+  ImVec4 color_removed_text = ImVec4(1.0f, 0.40f, 0.40f, 1.0f);
+  ImVec4 color_removed_hl = ImVec4(0.60f, 0.20f, 0.20f, 0.65f);
+  ImVec4 color_line_num = ImVec4(0.55f, 0.55f, 0.60f, 1.0f);
+  ImVec4 color_unchanged = ImVec4(0.88f, 0.88f, 0.88f, 1.0f);
+  ImVec4 color_header = ImVec4(0.75f, 0.80f, 0.95f, 1.0f);
+  
+  if (state.diff_split_view) {
+    // Split View Mode
+  ImGui::Columns(2, "DiffColumns", true);
+  
+    ImGui::PushStyleColor(ImGuiCol_Text, color_header);
+  ImGui::Text("Original");
+    ImGui::PopStyleColor();
+  ImGui::NextColumn();
+  
+    ImGui::PushStyleColor(ImGuiCol_Text, color_header);
+  ImGui::Text("Modified");
+    ImGui::PopStyleColor();
+  ImGui::NextColumn();
+  
+  ImGui::Separator();
+    ImGui::NextColumn();
+  ImGui::NextColumn();
+  
+  float start_y = ImGui::GetCursorPosY();
+    ImGui::BeginChild("OriginalDiffView", ImVec2(0, state.diff_editor_splitter_height), true, 
+      state.diff_wrap_lines ? 0 : ImGuiWindowFlags_HorizontalScrollbar);
+    
+    if (state.diff_wrap_lines) ImGui::PushTextWrapPos(0.0f);
+  
+  for (const auto &diff : diff_result) {
+      if (diff.type == DiffLine::UNCHANGED || diff.type == DiffLine::MODIFIED) {
+        ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
+        float line_height = state.diff_wrap_lines ? ImGui::CalcTextSize(diff.orig_text.c_str(), nullptr, false, ImGui::GetContentRegionAvail().x).y : ImGui::GetTextLineHeight();
+        ImVec2 line_size = ImVec2(ImGui::GetContentRegionAvail().x, line_height);
+        
+        if (diff.type == DiffLine::MODIFIED) {
+          ImGui::GetWindowDrawList()->AddRectFilled(cursor_pos, 
+            ImVec2(cursor_pos.x + line_size.x, cursor_pos.y + line_size.y), 
+            ImGui::ColorConvertFloat4ToU32(color_removed_bg));
+        }
+        
+        char line_num_buf[16];
+        snprintf(line_num_buf, sizeof(line_num_buf), "%4d", diff.orig_line_num);
+        ImGui::PushStyleColor(ImGuiCol_Text, color_line_num);
+        ImGui::Text("%s", line_num_buf);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        
+        if (diff.type == DiffLine::MODIFIED) {
+          auto char_diffs = ComputeCharDiff(diff.orig_text, diff.mod_text);
+          ImGui::Text("-");
+          ImGui::SameLine();
+          for (const auto &cd : char_diffs) {
+            if (cd.is_changed) {
+              ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.50f, 0.50f, 1.0f));
+              ImGui::SameLine(0, 0);
+              ImGui::Text("%s", cd.text.c_str());
+              ImGui::PopStyleColor();
+            } else {
+              ImGui::PushStyleColor(ImGuiCol_Text, color_removed_text);
+              ImGui::SameLine(0, 0);
+              ImGui::Text("%s", cd.text.c_str());
+              ImGui::PopStyleColor();
+            }
+          }
+        } else {
+          ImGui::PushStyleColor(ImGuiCol_Text, color_unchanged);
+          ImGui::Text(" %s", diff.orig_text.c_str());
+          ImGui::PopStyleColor();
+        }
+    } else if (diff.type == DiffLine::REMOVED) {
+        ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
+        float line_height = state.diff_wrap_lines ? ImGui::CalcTextSize(diff.orig_text.c_str(), nullptr, false, ImGui::GetContentRegionAvail().x).y : ImGui::GetTextLineHeight();
+        ImVec2 line_size = ImVec2(ImGui::GetContentRegionAvail().x, line_height);
+        ImGui::GetWindowDrawList()->AddRectFilled(cursor_pos, 
+          ImVec2(cursor_pos.x + line_size.x, cursor_pos.y + line_size.y), 
+          ImGui::ColorConvertFloat4ToU32(color_removed_bg));
+        
+        char line_num_buf[16];
+        snprintf(line_num_buf, sizeof(line_num_buf), "%4d", diff.orig_line_num);
+        ImGui::PushStyleColor(ImGuiCol_Text, color_line_num);
+        ImGui::Text("%s", line_num_buf);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, color_removed_text);
+        ImGui::Text("-%s", diff.orig_text.c_str());
+      ImGui::PopStyleColor();
+    } else {
+        ImGui::Text("    ");
+    }
+  }
+  
+    if (state.diff_wrap_lines) ImGui::PopTextWrapPos();
+  ImGui::EndChild();
+  ImGui::NextColumn();
+  
+  ImGui::SetCursorPosY(start_y);
+    ImGui::BeginChild("ModifiedDiffView", ImVec2(0, state.diff_editor_splitter_height), true, 
+      state.diff_wrap_lines ? 0 : ImGuiWindowFlags_HorizontalScrollbar);
+    
+    if (state.diff_wrap_lines) ImGui::PushTextWrapPos(0.0f);
+    
+    for (const auto &diff : diff_result) {
+      if (diff.type == DiffLine::UNCHANGED || diff.type == DiffLine::MODIFIED) {
+        ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
+        float line_height = state.diff_wrap_lines ? ImGui::CalcTextSize(diff.mod_text.c_str(), nullptr, false, ImGui::GetContentRegionAvail().x).y : ImGui::GetTextLineHeight();
+        ImVec2 line_size = ImVec2(ImGui::GetContentRegionAvail().x, line_height);
+        
+        if (diff.type == DiffLine::MODIFIED) {
+          ImGui::GetWindowDrawList()->AddRectFilled(cursor_pos, 
+            ImVec2(cursor_pos.x + line_size.x, cursor_pos.y + line_size.y), 
+            ImGui::ColorConvertFloat4ToU32(color_added_bg));
+        }
+        
+        char line_num_buf[16];
+        snprintf(line_num_buf, sizeof(line_num_buf), "%4d", diff.mod_line_num);
+        ImGui::PushStyleColor(ImGuiCol_Text, color_line_num);
+        ImGui::Text("%s", line_num_buf);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        
+        if (diff.type == DiffLine::MODIFIED) {
+          auto char_diffs = ComputeCharDiff(diff.orig_text, diff.mod_text, true);  // true = for new string
+          ImGui::Text("+");
+          ImGui::SameLine();
+          for (const auto &cd : char_diffs) {
+            if (cd.is_changed) {
+              ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 1.0f, 0.60f, 1.0f));
+              ImGui::SameLine(0, 0);
+              ImGui::Text("%s", cd.text.c_str());
+              ImGui::PopStyleColor();
+            } else {
+              ImGui::PushStyleColor(ImGuiCol_Text, color_added_text);
+              ImGui::SameLine(0, 0);
+              ImGui::Text("%s", cd.text.c_str());
+              ImGui::PopStyleColor();
+            }
+          }
+        } else {
+          ImGui::PushStyleColor(ImGuiCol_Text, color_unchanged);
+          ImGui::Text(" %s", diff.mod_text.c_str());
+          ImGui::PopStyleColor();
+        }
+      } else if (diff.type == DiffLine::ADDED) {
+        ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
+        float line_height = state.diff_wrap_lines ? ImGui::CalcTextSize(diff.mod_text.c_str(), nullptr, false, ImGui::GetContentRegionAvail().x).y : ImGui::GetTextLineHeight();
+        ImVec2 line_size = ImVec2(ImGui::GetContentRegionAvail().x, line_height);
+        ImGui::GetWindowDrawList()->AddRectFilled(cursor_pos, 
+          ImVec2(cursor_pos.x + line_size.x, cursor_pos.y + line_size.y), 
+          ImGui::ColorConvertFloat4ToU32(color_added_bg));
+        
+        char line_num_buf[16];
+        snprintf(line_num_buf, sizeof(line_num_buf), "%4d", diff.mod_line_num);
+        ImGui::PushStyleColor(ImGuiCol_Text, color_line_num);
+        ImGui::Text("%s", line_num_buf);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, color_added_text);
+        ImGui::Text("+%s", diff.mod_text.c_str());
+        ImGui::PopStyleColor();
+      } else {
+        ImGui::Text("    ");
+      }
+    }
+    
+    if (state.diff_wrap_lines) ImGui::PopTextWrapPos();
+    ImGui::EndChild();
+    ImGui::Columns(1);
+  } else {
+    // Unified View Mode
+    ImGui::PushStyleColor(ImGuiCol_Text, color_header);
+    ImGui::Text("Unified Diff");
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+    
+    ImGui::BeginChild("UnifiedDiffView", ImVec2(0, state.diff_editor_splitter_height), true, 
+      state.diff_wrap_lines ? 0 : ImGuiWindowFlags_HorizontalScrollbar);
+    
+    if (state.diff_wrap_lines) ImGui::PushTextWrapPos(0.0f);
+  
+  for (const auto &diff : diff_result) {
+    if (diff.type == DiffLine::UNCHANGED) {
+        char line_num_buf[32];
+        snprintf(line_num_buf, sizeof(line_num_buf), "%4d %4d", diff.orig_line_num, diff.mod_line_num);
+        ImGui::PushStyleColor(ImGuiCol_Text, color_line_num);
+        ImGui::Text("%s", line_num_buf);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, color_unchanged);
+        ImGui::Text("  %s", diff.orig_text.c_str());
+        ImGui::PopStyleColor();
+      } else if (diff.type == DiffLine::REMOVED) {
+        ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
+        float line_height = state.diff_wrap_lines ? ImGui::CalcTextSize(diff.orig_text.c_str(), nullptr, false, ImGui::GetContentRegionAvail().x).y : ImGui::GetTextLineHeight();
+        ImVec2 line_size = ImVec2(ImGui::GetContentRegionAvail().x, line_height);
+        ImGui::GetWindowDrawList()->AddRectFilled(cursor_pos, 
+          ImVec2(cursor_pos.x + line_size.x, cursor_pos.y + line_size.y), 
+          ImGui::ColorConvertFloat4ToU32(color_removed_bg));
+        
+        char line_num_buf[32];
+        snprintf(line_num_buf, sizeof(line_num_buf), "%4d     ", diff.orig_line_num);
+        ImGui::PushStyleColor(ImGuiCol_Text, color_line_num);
+        ImGui::Text("%s", line_num_buf);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, color_removed_text);
+        ImGui::Text("- %s", diff.orig_text.c_str());
+        ImGui::PopStyleColor();
+    } else if (diff.type == DiffLine::ADDED) {
+        ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
+        float line_height = state.diff_wrap_lines ? ImGui::CalcTextSize(diff.mod_text.c_str(), nullptr, false, ImGui::GetContentRegionAvail().x).y : ImGui::GetTextLineHeight();
+        ImVec2 line_size = ImVec2(ImGui::GetContentRegionAvail().x, line_height);
+        ImGui::GetWindowDrawList()->AddRectFilled(cursor_pos, 
+          ImVec2(cursor_pos.x + line_size.x, cursor_pos.y + line_size.y), 
+          ImGui::ColorConvertFloat4ToU32(color_added_bg));
+        
+        char line_num_buf[32];
+        snprintf(line_num_buf, sizeof(line_num_buf), "     %4d", diff.mod_line_num);
+        ImGui::PushStyleColor(ImGuiCol_Text, color_line_num);
+        ImGui::Text("%s", line_num_buf);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, color_added_text);
+      ImGui::Text("+ %s", diff.mod_text.c_str());
+        ImGui::PopStyleColor();
+      } else if (diff.type == DiffLine::MODIFIED) {
+        // Show removed line
+        ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
+        float line_height = state.diff_wrap_lines ? ImGui::CalcTextSize(diff.orig_text.c_str(), nullptr, false, ImGui::GetContentRegionAvail().x).y : ImGui::GetTextLineHeight();
+        ImGui::GetWindowDrawList()->AddRectFilled(cursor_pos, 
+          ImVec2(cursor_pos.x + ImGui::GetContentRegionAvail().x, cursor_pos.y + line_height), 
+          ImGui::ColorConvertFloat4ToU32(color_removed_bg));
+        
+        char line_num_buf[32];
+        snprintf(line_num_buf, sizeof(line_num_buf), "%4d     ", diff.orig_line_num);
+        ImGui::PushStyleColor(ImGuiCol_Text, color_line_num);
+        ImGui::Text("%s", line_num_buf);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        
+        auto char_diffs_old = ComputeCharDiff(diff.orig_text, diff.mod_text);
+        ImGui::Text("-");
+        ImGui::SameLine();
+        for (const auto &cd : char_diffs_old) {
+          if (cd.is_changed) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.50f, 0.50f, 1.0f));
+            ImGui::SameLine(0, 0);
+            ImGui::Text("%s", cd.text.c_str());
+      ImGui::PopStyleColor();
+    } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, color_removed_text);
+            ImGui::SameLine(0, 0);
+            ImGui::Text("%s", cd.text.c_str());
+            ImGui::PopStyleColor();
+          }
+        }
+        
+        // Show added line
+        cursor_pos = ImGui::GetCursorScreenPos();
+        line_height = state.diff_wrap_lines ? ImGui::CalcTextSize(diff.mod_text.c_str(), nullptr, false, ImGui::GetContentRegionAvail().x).y : ImGui::GetTextLineHeight();
+        ImGui::GetWindowDrawList()->AddRectFilled(cursor_pos, 
+          ImVec2(cursor_pos.x + ImGui::GetContentRegionAvail().x, cursor_pos.y + line_height), 
+          ImGui::ColorConvertFloat4ToU32(color_added_bg));
+        
+        snprintf(line_num_buf, sizeof(line_num_buf), "     %4d", diff.mod_line_num);
+        ImGui::PushStyleColor(ImGuiCol_Text, color_line_num);
+        ImGui::Text("%s", line_num_buf);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        
+        auto char_diffs_new = ComputeCharDiff(diff.orig_text, diff.mod_text, true);  // true = for new string
+        ImGui::Text("+");
+        ImGui::SameLine();
+        for (const auto &cd : char_diffs_new) {
+          if (cd.is_changed) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.50f, 1.0f, 0.60f, 1.0f));
+            ImGui::SameLine(0, 0);
+            ImGui::Text("%s", cd.text.c_str());
+            ImGui::PopStyleColor();
+          } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, color_added_text);
+            ImGui::SameLine(0, 0);
+            ImGui::Text("%s", cd.text.c_str());
+            ImGui::PopStyleColor();
+          }
+        }
+      }
+    }
+    
+    if (state.diff_wrap_lines) ImGui::PopTextWrapPos();
+  ImGui::EndChild();
+  }
+}
+
+void RenderPromptEditor(AppState &state) {
+  if (!state.show_prompt_editor) {
+    if (state.last_logged_editor_open) {
+      DevLog(state, "RenderPromptEditor: Editor closed");
+      state.last_logged_editor_open = false;
+      state.last_logged_prompt_tab = -1;
+    }
+    return;
+  }
+  
+  ImGuiStateTracker tracker(state);
+  
+  // Only log when editor is first opened
+  if (!state.last_logged_editor_open) {
+    DevLog(state, "RenderPromptEditor: Editor window opened");
+    state.last_logged_editor_open = true;
+  }
+  
+  // Initialize history on first open
+  InitializePromptHistory(state);
+  
+  ImGui::SetNextWindowSize(ImVec2(900, 700), ImGuiCond_FirstUseEver);
+  ImGuiWindowScope window("Prompt Editor", &state.show_prompt_editor, 0);
+  if (!window) {
+    DevLog(state, "RenderPromptEditor: Window scope returned false");
+    return;
+  }
+  
+  // Header with modification status and controls
+  ImGui::BeginChild("HeaderControls", ImVec2(0, 30), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
+  int placeholders_far_right = 150;
+  // Status text on the left
+  ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 10.0f); // Move down 10 pixels
+  if (state.prompts_modified) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.0f, 1.0f));
+    ImGui::Text("Prompts have been modified");
+    placeholders_far_right = 115;
+    ImGui::PopStyleColor();
+  } else {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
+    ImGui::Text("Using default prompts");
+    ImGui::PopStyleColor();
+  }
+  
+  // Controls on the right
+  ImGui::SameLine();
+  float available_width = ImGui::GetContentRegionAvail().x;
+  ImGui::SetCursorPosX(available_width - placeholders_far_right); // Position controls on the right
+  ImGui::SetCursorPosY(ImGui::GetCursorPosY() -5.0f); // Reset Y position for controls
+  
+  ImGui::Checkbox("Show Diff View", &state.show_diff_view);
+  
+  // Clear All History button
+  ImGui::SameLine();
+  ImGui::SetCursorPosY(ImGui::GetCursorPosY() -5.0f); // Reset Y position for controls
+  {
+    bool any_history = (state.prompt1_history.history.size() > 1) ||
+                       (state.prompt2_history.history.size() > 1) ||
+                       (state.audit_prompt_history.history.size() > 1);
+    ImGuiDisabledScope disable_clear(!any_history);
+    if (ImGui::Button(ICON_FA_TRASH " Clear All History")) {
+      DevLog(state, "Clear All History button clicked");
+      state.show_confirm_clear_all_history = true;
+    }
+  }
+  if ((state.prompt1_history.history.size() <= 1 && 
+       state.prompt2_history.history.size() <= 1 &&
+       state.audit_prompt_history.history.size() <= 1) && 
+      ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+    ImGui::SetTooltip("No history to clear");
+  } else if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Clear history for all prompts");
+  }
+  
+  ImGui::EndChild();
+  
+  ImGui::Separator();
+  
+  // Tab bar for different prompts
+  ImGuiTabBarScope tab_bar("PromptTabs");
+  if (tab_bar) {
+    // Prompt 1 Tab
+    {
+      ImGuiTabItemScope tab1("Prompt 1 (Feedback)");
+      if (tab1) {
+        if (state.last_logged_prompt_tab != 0) {
+          DevLog(state, "RenderPromptEditor: Switched to Prompt 1 tab");
+          state.last_logged_prompt_tab = 0;
+        }
+        state.selected_prompt_tab = 0;
+        
+        
+        if (state.show_diff_view) {
+          ImGui::Text("Diff View:");
+          ImGui::Separator();
+          RenderDiffView(state, state.prompt1_original, state.prompt1_modified, 0);
+          
+          // Resizable splitter between diff view and editor
+          float editor_height = ImGui::GetContentRegionAvail().y - 50;
+          Splitter("DiffEditorSplitter1", &state.diff_editor_splitter_height, &editor_height, 100.0f, 100.0f);
+          
+        }
+        
+        ImGui::Text("Editor:");
+        
+        // Calculate available height for editor (leave space for buttons)
+        float available_height = state.show_diff_view ? ImGui::GetContentRegionAvail().y - 50 : ImGui::GetContentRegionAvail().y - 50;
+        ImGui::BeginChild("Prompt1Editor", ImVec2(0, available_height), true);
+        
+        char buffer[8192];
+        strncpy(buffer, state.prompt1_modified.c_str(), sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
+        
+        if (ImGui::InputTextMultiline("##Prompt1", buffer, sizeof(buffer), 
+            ImVec2(-1, -1), ImGuiInputTextFlags_AllowTabInput)) {
+          state.prompt1_modified = buffer;
+          state.prompts_modified = (state.prompt1_modified != state.prompt1_original) ||
+                                   (state.prompt2_modified != state.prompt2_original) ||
+                                   (state.audit_prompt_modified != state.audit_prompt_original);
+        }
+        
+        // Push to history when user finishes editing (clicks away, etc.)
+        if (ImGui::IsItemDeactivatedAfterEdit() && !state.skip_next_history_push) {
+          PushToHistory(state.prompt1_history, state.prompt1_modified);
+          DevLog(state, "Pushed Prompt1 edit to history");
+        }
+        if (state.skip_next_history_push) {
+          state.skip_next_history_push = false; // Reset flag
+        }
+        
+        ImGui::EndChild();
+      }
+    }
+    
+    // Prompt 2 Tab
+    {
+      ImGuiTabItemScope tab2("Prompt 2 (Feedback Follow-up)");
+      if (tab2) {
+        if (state.last_logged_prompt_tab != 1) {
+          DevLog(state, "RenderPromptEditor: Switched to Prompt 2 tab");
+          DevLog(state, "  -> Prompt2 length=" + std::to_string(state.prompt2_modified.length()));
+          state.last_logged_prompt_tab = 1;
+        }
+        state.selected_prompt_tab = 1;
+        
+        
+        if (state.show_diff_view) {
+          ImGui::Text("Diff View:");
+          ImGui::Separator();
+          RenderDiffView(state, state.prompt2_original, state.prompt2_modified, 1);
+          
+          // Resizable splitter between diff view and editor
+          float editor_height = ImGui::GetContentRegionAvail().y - 50;
+          Splitter("DiffEditorSplitter2", &state.diff_editor_splitter_height, &editor_height, 100.0f, 100.0f);
+          
+          ImGui::Separator();
+        }
+        
+        ImGui::Text("Editor:");
+        
+        // Calculate available height for editor (leave space for buttons)
+        float available_height = state.show_diff_view ? ImGui::GetContentRegionAvail().y - 50 : ImGui::GetContentRegionAvail().y - 50;
+        ImGui::BeginChild("Prompt2Editor", ImVec2(0, available_height), true);
+        
+        char buffer[8192];
+        strncpy(buffer, state.prompt2_modified.c_str(), sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
+        
+        if (ImGui::InputTextMultiline("##Prompt2", buffer, sizeof(buffer), 
+            ImVec2(-1, -1), ImGuiInputTextFlags_AllowTabInput)) {
+          DevLog(state, "RenderPromptEditor: Prompt2 modified by user");
+          state.prompt2_modified = buffer;
+          state.prompts_modified = (state.prompt1_modified != state.prompt1_original) ||
+                                   (state.prompt2_modified != state.prompt2_original) ||
+                                   (state.audit_prompt_modified != state.audit_prompt_original);
+        }
+        
+        // Push to history when user finishes editing
+        if (ImGui::IsItemDeactivatedAfterEdit() && !state.skip_next_history_push) {
+          PushToHistory(state.prompt2_history, state.prompt2_modified);
+          DevLog(state, "Pushed Prompt2 edit to history");
+        }
+        if (state.skip_next_history_push) {
+          state.skip_next_history_push = false; // Reset flag
+        }
+        
+        ImGui::EndChild();
+      }
+    }
+    
+    // Audit Prompt Tab
+    {
+      ImGuiTabItemScope tab3("Audit Prompt");
+      if (tab3) {
+        if (state.last_logged_prompt_tab != 2) {
+          DevLog(state, "RenderPromptEditor: Switched to Audit Prompt tab");
+          state.last_logged_prompt_tab = 2;
+        }
+        state.selected_prompt_tab = 2;
+        
+        
+        if (state.show_diff_view) {
+          ImGui::Text("Diff View:");
+          ImGui::Separator();
+          RenderDiffView(state, state.audit_prompt_original, state.audit_prompt_modified, 2);
+          
+          // Resizable splitter between diff view and editor
+          float editor_height = ImGui::GetContentRegionAvail().y - 50;
+          Splitter("DiffEditorSplitter3", &state.diff_editor_splitter_height, &editor_height, 100.0f, 100.0f);
+          
+          ImGui::Separator();
+        }
+        
+        ImGui::Text("Editor:");
+        
+        // Calculate available height for editor (leave space for buttons)
+        float available_height = state.show_diff_view ? ImGui::GetContentRegionAvail().y - 50 : ImGui::GetContentRegionAvail().y - 50;
+        ImGui::BeginChild("AuditPromptEditor", ImVec2(0, available_height), true);
+        
+        char buffer[8192];
+        strncpy(buffer, state.audit_prompt_modified.c_str(), sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
+        
+        if (ImGui::InputTextMultiline("##AuditPrompt", buffer, sizeof(buffer), 
+            ImVec2(-1, -1), ImGuiInputTextFlags_AllowTabInput)) {
+          state.audit_prompt_modified = buffer;
+          state.prompts_modified = (state.prompt1_modified != state.prompt1_original) ||
+                                   (state.prompt2_modified != state.prompt2_original) ||
+                                   (state.audit_prompt_modified != state.audit_prompt_original);
+        }
+        
+        // Push to history when user finishes editing
+        if (ImGui::IsItemDeactivatedAfterEdit() && !state.skip_next_history_push) {
+          PushToHistory(state.audit_prompt_history, state.audit_prompt_modified);
+          DevLog(state, "Pushed Audit Prompt edit to history");
+        }
+        if (state.skip_next_history_push) {
+          state.skip_next_history_push = false; // Reset flag
+        }
+        
+        ImGui::EndChild();
+      }
+    }
+  }
+  
+  // Bottom buttons
+  ImGui::Separator();
+  
+  // Validation check for all prompts
+  bool prompt1_valid = IsPromptValid(state.prompt1_modified);
+  bool prompt2_valid = IsPromptValid(state.prompt2_modified);
+  bool audit_valid = IsPromptValid(state.audit_prompt_modified);
+  bool all_valid = prompt1_valid && prompt2_valid && audit_valid;
+  
+  // Show validation warnings if any prompt is invalid
+  if (!all_valid) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+    ImGui::Text("Warning: ");
+    ImGui::SameLine();
+    ImGui::PopStyleColor();
+    
+    if (!prompt1_valid) ImGui::Text("Prompt 1 is empty or contains only whitespace. ");
+    if (!prompt2_valid) {
+      ImGui::SameLine();
+      ImGui::Text("Prompt 2 is empty or contains only whitespace. ");
+    }
+    if (!audit_valid) {
+      ImGui::SameLine();
+      ImGui::Text("Audit Prompt is empty or contains only whitespace. ");
+    }
+    ImGui::Spacing();
+  }
+  
+  if (ImGui::Button("Reset to Default", ImVec2(150, 0))) {
+    DevLog(state, "RenderPromptEditor: Reset to Default clicked, tab=" + std::to_string(state.selected_prompt_tab));
+    if (state.selected_prompt_tab == 0) {
+      PushToHistory(state.prompt1_history, state.prompt1_modified);
+      state.prompt1_modified = state.prompt1_original;
+      PushToHistory(state.prompt1_history, state.prompt1_modified);
+    } else if (state.selected_prompt_tab == 1) {
+      PushToHistory(state.prompt2_history, state.prompt2_modified);
+      state.prompt2_modified = state.prompt2_original;
+      PushToHistory(state.prompt2_history, state.prompt2_modified);
+    } else if (state.selected_prompt_tab == 2) {
+      PushToHistory(state.audit_prompt_history, state.audit_prompt_modified);
+      state.audit_prompt_modified = state.audit_prompt_original;
+      PushToHistory(state.audit_prompt_history, state.audit_prompt_modified);
+    }
+    state.prompts_modified = (state.prompt1_modified != state.prompt1_original) ||
+                             (state.prompt2_modified != state.prompt2_original) ||
+                             (state.audit_prompt_modified != state.audit_prompt_original);
+    SavePrompts(state);
+  }
+  
+  ImGui::SameLine();
+  if (ImGui::Button("Reset All to Default", ImVec2(150, 0))) {
+    DevLog(state, "RenderPromptEditor: Reset All to Default clicked");
+    PushToHistory(state.prompt1_history, state.prompt1_modified);
+    PushToHistory(state.prompt2_history, state.prompt2_modified);
+    PushToHistory(state.audit_prompt_history, state.audit_prompt_modified);
+    
+    state.prompt1_modified = state.prompt1_original;
+    state.prompt2_modified = state.prompt2_original;
+    state.audit_prompt_modified = state.audit_prompt_original;
+    
+    PushToHistory(state.prompt1_history, state.prompt1_modified);
+    PushToHistory(state.prompt2_history, state.prompt2_modified);
+    PushToHistory(state.audit_prompt_history, state.audit_prompt_modified);
+    
+    state.prompts_modified = false;
+    SavePrompts(state);
+  }
+  
+  ImGui::SameLine();
+  
+  // Disable Save button if any prompt is invalid
+  ImGuiDisabledScope disable_save(!all_valid);
+  if (ImGui::Button("Save", ImVec2(100, 0))) {
+    DevLog(state, "RenderPromptEditor: Save clicked");
+    PushToHistory(state.prompt1_history, state.prompt1_modified);
+    PushToHistory(state.prompt2_history, state.prompt2_modified);
+    PushToHistory(state.audit_prompt_history, state.audit_prompt_modified);
+    SavePrompts(state);
+  }
+  
+  if (!all_valid && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+    ImGui::SetTooltip("Cannot save: One or more prompts are empty");
+  }
+  
+  ImGui::SameLine();
+  if (ImGui::Button("Close", ImVec2(100, 0))) {
+    DevLog(state, "RenderPromptEditor: Close clicked");
+    state.show_prompt_editor = false;
+  }
 }
 
 void RenderMainUI(AppState &state) {
@@ -5006,6 +6612,21 @@ void RenderMainUI(AppState &state) {
               "cached layers. Ensures fresh builds every time.");
         }
 
+        // NEW: Docker debug option
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Enable Docker build debug mode",
+                            &state.use_docker_debug)) {
+          SaveConfig(state);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered()) {
+          ImGui::SetTooltip(
+              "Enables verbose Docker build output with --progress=plain.\n"
+              "Shows detailed build steps and command output for debugging.\n"
+              "Useful for troubleshooting build issues.");
+        }
+
         // NEW: Max concurrent tasks setting
         ImGui::Spacing();
         ImGui::Text("Maximum Concurrent Tasks:");
@@ -5051,30 +6672,74 @@ void RenderMainUI(AppState &state) {
   {
     ImGuiTabItemScope _tab_manage("Manage", nullptr, manage_tab_flags);
     if (_tab_manage) {
+      bool is_refreshing = state.docker_refreshing.load();
+      
       if (!state.docker_loaded) {
         if (g_fonts_loaded && g_font_awesome_solid) {
           // Use Font Awesome icon inside the button
           ImGui::PushFont(g_font_awesome_solid);
-          if (ImGui::Button((std::string(ICON_FA_REFRESH " ") + "Refresh").c_str())) {
-            RefreshDockerState(state);
+          if (is_refreshing) {
+            ImGuiDisabledScope _dis;
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.3f, 0.4f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.3f, 0.4f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.2f, 0.3f, 0.4f, 1.0f));
+            ImGui::Button("##refreshing_button", ImVec2(125.0f, 0.0f));
+            ImGui::PopStyleColor(3);
+            // Draw spinning icon over the button
+            ImVec2 button_pos = ImGui::GetItemRectMin();
+            ImGui::SetCursorScreenPos(ImVec2(button_pos.x + 10.0f, button_pos.y + ImGui::GetStyle().FramePadding.y));
+            DrawSpinningIcon(ICON_FA_SPINNER);
+            ImGui::SameLine();
+            ImGui::SetCursorScreenPos(ImVec2(button_pos.x + 30.0f, button_pos.y + ImGui::GetStyle().FramePadding.y - 5));
+            ImGui::TextUnformatted("Refreshing...");
+          } else {
+            if (ImGui::Button((std::string(ICON_FA_REFRESH " ") + "Refresh").c_str())) {
+              RefreshDockerStateAsync(state);
+            }
           }
           ImGui::PopFont();
         } else {
-          if (ImGui::Button("Refresh")) {
-            RefreshDockerState(state);
+          if (is_refreshing) {
+            ImGuiDisabledScope _dis;
+            ImGui::Button("Refreshing...");
+          } else {
+            if (ImGui::Button("Refresh")) {
+              RefreshDockerStateAsync(state);
+            }
           }
         }
       } else {
         if (g_fonts_loaded && g_font_awesome_solid) {
           // Use Font Awesome icon inside the button
           ImGui::PushFont(g_font_awesome_solid);
-          if (ImGui::Button((std::string(ICON_FA_REFRESH " ") + "Refresh").c_str())) {
-            RefreshDockerState(state);
+          if (is_refreshing) {
+            ImGuiDisabledScope _dis;
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.3f, 0.4f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.3f, 0.4f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.2f, 0.3f, 0.4f, 1.0f));
+            ImGui::Button("##refreshing_button2", ImVec2(125.0f, 0.0f));
+            ImGui::PopStyleColor(3);
+            // Draw spinning icon over the button
+            ImVec2 button_pos = ImGui::GetItemRectMin();
+            ImGui::SetCursorScreenPos(ImVec2(button_pos.x + 10.0f, button_pos.y + ImGui::GetStyle().FramePadding.y));
+            DrawSpinningIcon(ICON_FA_SPINNER);
+            ImGui::SameLine();
+            ImGui::SetCursorScreenPos(ImVec2(button_pos.x + 30.0f, button_pos.y + ImGui::GetStyle().FramePadding.y - 5));
+            ImGui::TextUnformatted("Refreshing...");
+          } else {
+            if (ImGui::Button((std::string(ICON_FA_REFRESH " ") + "Refresh").c_str())) {
+              RefreshDockerStateAsync(state);
+            }
           }
           ImGui::PopFont();
         } else {
-          if (ImGui::Button("Refresh")) {
-            RefreshDockerState(state);
+          if (is_refreshing) {
+            ImGuiDisabledScope _dis;
+            ImGui::Button("Refreshing...");
+          } else {
+            if (ImGui::Button("Refresh")) {
+              RefreshDockerStateAsync(state);
+            }
           }
         }
       }
@@ -5102,83 +6767,123 @@ void RenderMainUI(AppState &state) {
       } else {
         // Docker is available - show containers and images
 
+      // Create thread-safe snapshots of containers and images
+      std::vector<AppState::DockerContainer> containers_snapshot;
+      std::vector<AppState::DockerImage> images_snapshot;
+      {
+        std::lock_guard<std::mutex> lock(state.docker_state_mutex);
+        containers_snapshot = state.containers;
+        images_snapshot = state.images;
+      }
+
       // Containers list
-      ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Containers");
+      if (state.docker_loaded) {
+        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Containers");
+      } else {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Containers");
+      }
 
       // NEW: Bulk container cleanup button
-      if (state.containers.size() > 1) {
+      if (containers_snapshot.size() > 1) {
         ImGui::SameLine();
         ImGuiStyleColorScope _btn(ImGuiCol_Button,
                                   ImVec4(0.9f, 0.3f, 0.2f, 1.0f));
         if (ImGui::Button("Remove All Containers")) {
-          for (const auto &c : state.containers) {
+          for (const auto &c : containers_snapshot) {
             std::string sh = std::string("docker rm -f \"") + c.name +
                              "\" >/dev/null 2>&1 || true";
             RunShellLines(sh);
           }
-          RefreshDockerState(state);
+          RefreshDockerStateAsync(state);
         }
       }
 
       {
-        ImGuiChildScope _containers("containers", ImVec2(0, 200), true);
-        for (size_t i = 0; i < state.containers.size(); ++i) {
-          const auto &c = state.containers[i];
-          
-          // Get available width before creating columns
-          float available_width = ImGui::GetContentRegionAvail().x;
-          
-          // Use columns for proper layout with scrollable text
-          ImGui::Columns(3, nullptr, false);
-          
-          // Text column (scrollable if too long) - reserve space for buttons
-          ImGui::SetColumnWidth(0, available_width - 160.0f);
-          ImGui::SetColumnWidth(1, 90.0f);  // Fixed width for Open Logs button
-          ImGui::SetColumnWidth(2, 80.0f);  // Fixed width for Delete button
-          
-          ImGui::BeginChild(("##container_text_" + std::to_string(i)).c_str(),
-                           ImVec2(0, ImGui::GetTextLineHeight() + ImGui::GetStyle().FramePadding.y * 6 - 2),
-                           false,
-                           ImGuiWindowFlags_HorizontalScrollbar);
-          
-          // Build the full container info string
-          std::string container_info = c.name + " | " + c.image + " | " + c.status;
-          ImGui::TextUnformatted(container_info.c_str());
-          ImGui::EndChild();
-          ImGui::NextColumn();
-          
-          // Open Logs column
-          if (!c.log_path.empty()) {
-            if (ImGui::SmallButton(
-                    (std::string("Open Logs##") + std::to_string(i)).c_str())) {
-              OpenFolderExternal(c.log_path);
-            }
-          } else {
-            ImGui::TextDisabled("(no log)");
-          }
-          ImGui::NextColumn();
-          
-          // Delete column
-          if (ImGui::SmallButton(
-                  (std::string("Delete##") + std::to_string(i)).c_str())) {
-            std::string sh = std::string("docker rm -f \"") + c.name +
-                             "\" >/dev/null 2>&1 || true";
-            RunShellLines(sh);
-            RefreshDockerState(state);
-          }
-          ImGui::NextColumn();
-          
-          ImGui::Columns(1);
-          ImGui::Separator();
+        // Apply disabled style if not yet loaded
+        if (!state.docker_loaded) {
+          ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.15f, 0.15f, 0.15f, 0.5f));
         }
+        
+        ImGuiChildScope _containers("containers", ImVec2(0, 200), true);
+        
+        if (!state.docker_loaded) {
+          // Show grayed out message before first refresh
+          ImGui::SetCursorPos(ImVec2(ImGui::GetContentRegionAvail().x * 0.5f - 100.0f, 
+                                      ImGui::GetContentRegionAvail().y * 0.5f - 10.0f));
+          ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Click the Refresh button to load the containers");
+        } else if (containers_snapshot.empty()) {
+          // Show message when loaded but no containers found
+          ImGui::SetCursorPos(ImVec2(ImGui::GetContentRegionAvail().x * 0.5f - 70.0f, 
+                                      ImGui::GetContentRegionAvail().y * 0.5f - 10.0f));
+          ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "No containers found");
+        } else {
+          // Show containers list
+          for (size_t i = 0; i < containers_snapshot.size(); ++i) {
+            const auto &c = containers_snapshot[i];
+            
+            // Get available width before creating columns
+            float available_width = ImGui::GetContentRegionAvail().x;
+            
+            // Use columns for proper layout with scrollable text
+            ImGui::Columns(3, nullptr, false);
+            
+            // Text column (scrollable if too long) - reserve space for buttons
+            ImGui::SetColumnWidth(0, available_width - 160.0f);
+            ImGui::SetColumnWidth(1, 90.0f);  // Fixed width for Open Logs button
+            ImGui::SetColumnWidth(2, 80.0f);  // Fixed width for Delete button
+            
+            ImGui::BeginChild(("##container_text_" + std::to_string(i)).c_str(),
+                             ImVec2(0, ImGui::GetTextLineHeight() + ImGui::GetStyle().FramePadding.y * 6 - 2),
+                             false,
+                             ImGuiWindowFlags_HorizontalScrollbar);
+            
+            // Build the full container info string
+            std::string container_info = c.name + " | " + c.image + " | " + c.status;
+            ImGui::TextUnformatted(container_info.c_str());
+            ImGui::EndChild();
+            ImGui::NextColumn();
+            
+            // Open Logs column
+            if (!c.log_path.empty()) {
+              if (ImGui::SmallButton(
+                      (std::string("Open Logs##") + std::to_string(i)).c_str())) {
+                OpenFolderExternal(c.log_path);
+              }
+            } else {
+              ImGui::TextDisabled("(no log)");
+            }
+            ImGui::NextColumn();
+            
+            // Delete column
+            if (ImGui::SmallButton(
+                    (std::string("Delete##") + std::to_string(i)).c_str())) {
+              std::string sh = std::string("docker rm -f \"") + c.name +
+                               "\" >/dev/null 2>&1 || true";
+              RunShellLines(sh);
+              RefreshDockerStateAsync(state);
+            }
+            ImGui::NextColumn();
+            
+            ImGui::Columns(1);
+            ImGui::Separator();
+          }
+        }
+      }
+      
+      if (!state.docker_loaded) {
+        ImGui::PopStyleColor();
       }
 
 
       ImGui::Spacing();
-      ImGui::TextColored(ImVec4(0.8f, 0.9f, 0.6f, 1.0f), "Images");
+      if (state.docker_loaded) {
+        ImGui::TextColored(ImVec4(0.8f, 0.9f, 0.6f, 1.0f), "Images");
+      } else {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Images");
+      }
 
       // NEW: Bulk image cleanup button
-      if (state.images.size() > 1) {
+      if (images_snapshot.size() > 1) {
         ImGui::SameLine();
         ImGuiStyleColorScope _btn(ImGuiCol_Button,
                                   ImVec4(0.9f, 0.3f, 0.2f, 1.0f));
@@ -5186,7 +6891,7 @@ void RenderMainUI(AppState &state) {
           std::string all_errors;
           bool any_success = false;
 
-          for (const auto &img : state.images) {
+          for (const auto &img : images_snapshot) {
             std::string error_msg;
             if (SafeDeleteImage(img.id, error_msg)) {
               any_success = true;
@@ -5199,7 +6904,7 @@ void RenderMainUI(AppState &state) {
           }
 
           if (any_success) {
-            RefreshDockerState(state);
+            RefreshDockerStateAsync(state);
           }
 
           if (!all_errors.empty()) {
@@ -5209,51 +6914,77 @@ void RenderMainUI(AppState &state) {
       }
 
       {
-        ImGuiChildScope _images("images", ImVec2(0, 160), true);
-        for (size_t i = 0; i < state.images.size(); ++i) {
-          const auto &img = state.images[i];
-          
-          // Get available width before creating columns
-          float available_width = ImGui::GetContentRegionAvail().x;
-          
-          // Use columns for proper layout with scrollable text
-          ImGui::Columns(2, nullptr, false);
-          
-          // Text column (scrollable if too long) - reserve space for button
-          ImGui::SetColumnWidth(0, available_width - 80.0f);
-          ImGui::SetColumnWidth(1, 80.0f);  // Fixed width for Delete button
-          
-          ImGui::BeginChild(("##image_text_" + std::to_string(i)).c_str(),
-                           ImVec2(0, ImGui::GetTextLineHeight() + ImGui::GetStyle().FramePadding.y * 6 - 2),
-                           false,
-                           ImGuiWindowFlags_HorizontalScrollbar);
-          
-          // Build the full image info string
-          std::string image_info = img.repo_tag + " | " + img.id + " | " + img.size;
-          ImGui::TextUnformatted(image_info.c_str());
-          ImGui::EndChild();
-          ImGui::NextColumn();
-          
-          // Delete column
-          if (ImGui::SmallButton(
-                  (std::string("Delete##") + std::to_string(i)).c_str())) {
-            std::string error_msg;
-            if (SafeDeleteImage(img.id, error_msg)) {
-              RefreshDockerState(state);
-            } else {
-              // Store error message and show error window
-              state.image_delete_error = error_msg;
-            }
-          }
-          ImGui::NextColumn();
-          
-          ImGui::Columns(1);
-          ImGui::Separator();
+        // Apply disabled style if not yet loaded
+        if (!state.docker_loaded) {
+          ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.15f, 0.15f, 0.15f, 0.5f));
         }
+        
+        ImGuiChildScope _images("images", ImVec2(0, 160), true);
+        
+        if (!state.docker_loaded) {
+          // Show grayed out message before first refresh
+          ImGui::SetCursorPos(ImVec2(ImGui::GetContentRegionAvail().x * 0.5f - 85.0f, 
+                                      ImGui::GetContentRegionAvail().y * 0.5f - 10.0f));
+          ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Click the Refresh button to load the images");
+        } else if (images_snapshot.empty()) {
+          // Show message when loaded but no images found
+          ImGui::SetCursorPos(ImVec2(ImGui::GetContentRegionAvail().x * 0.5f - 60.0f, 
+                                      ImGui::GetContentRegionAvail().y * 0.5f - 10.0f));
+          ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "No images found");
+        } else {
+          // Show images list
+          for (size_t i = 0; i < images_snapshot.size(); ++i) {
+            const auto &img = images_snapshot[i];
+            
+            // Get available width before creating columns
+            float available_width = ImGui::GetContentRegionAvail().x;
+            
+            // Use columns for proper layout with scrollable text
+            ImGui::Columns(2, nullptr, false);
+            
+            // Text column (scrollable if too long) - reserve space for button
+            ImGui::SetColumnWidth(0, available_width - 80.0f);
+            ImGui::SetColumnWidth(1, 80.0f);  // Fixed width for Delete button
+            
+            ImGui::BeginChild(("##image_text_" + std::to_string(i)).c_str(),
+                             ImVec2(0, ImGui::GetTextLineHeight() + ImGui::GetStyle().FramePadding.y * 6 - 2),
+                             false,
+                             ImGuiWindowFlags_HorizontalScrollbar);
+            
+            // Build the full image info string
+            std::string image_info = img.repo_tag + " | " + img.id + " | " + img.size;
+            ImGui::TextUnformatted(image_info.c_str());
+            ImGui::EndChild();
+            ImGui::NextColumn();
+            
+            // Delete column
+            if (ImGui::SmallButton(
+                    (std::string("Delete##") + std::to_string(i)).c_str())) {
+              std::string error_msg;
+              if (SafeDeleteImage(img.id, error_msg)) {
+                RefreshDockerStateAsync(state);
+              } else {
+                // Store error message and show error window
+                state.image_delete_error = error_msg;
+              }
+            }
+            ImGui::NextColumn();
+            
+            ImGui::Columns(1);
+            ImGui::Separator();
+          }
+        }
+      }
+      
+      if (!state.docker_loaded) {
+        ImGui::PopStyleColor();
       }
 
       // Error popup for image deletion moved to global scope (after TabBar)
 
+      } // end else (Docker is available)
+
+      // Logs Browser - always available regardless of Docker status
       ImGui::Spacing();
       ImGui::Separator();
       ImGui::Spacing();
@@ -5275,37 +7006,83 @@ void RenderMainUI(AppState &state) {
       }
       
       if (!logs_root.empty() && DirectoryExists(logs_root)) {
-        // Left: tasks list
+        // Column 1: tasks list with action buttons
         ImGui::BeginChild("logs_tasks",
-                          ImVec2(ImGui::GetContentRegionAvail().x * 0.33f, 220),
+                          ImVec2(ImGui::GetContentRegionAvail().x * 0.25f, 220),
                           true);
         DIR *d = opendir(logs_root.c_str());
         if (d) {
           int idx = 0;
           struct dirent *e;
+          std::vector<std::string> task_names;
           while ((e = readdir(d)) != NULL) {
             if (e->d_name[0] == '.')
               continue;
             std::string task_dir = logs_root + "/" + e->d_name;
             if (!DirectoryExists(task_dir))
               continue;
-            bool selected = (state.selected_task_index == idx);
-            if (ImGui::Selectable(e->d_name, selected)) {
-              state.selected_task_index = idx;
-              state.selected_run_index = -1;
-            }
-            idx++;
+            task_names.push_back(e->d_name);
           }
           closedir(d);
+          
+          for (size_t i = 0; i < task_names.size(); i++) {
+            bool selected = (state.selected_task_index == (int)i);
+            std::string task_dir = logs_root + "/" + task_names[i];
+            
+            float item_height = ImGui::GetTextLineHeight() * 2 + 10;
+            float start_y = ImGui::GetCursorPosY();
+            float button_size = ImGui::CalcTextSize(ICON_FA_FOLDER_OPEN).x + ImGui::GetStyle().FramePadding.x * 2;
+            float buttons_width = button_size * 2 + ImGui::GetStyle().ItemSpacing.x + 5;
+            
+            // Text with wrapping in a child for proper overflow
+            ImGui::BeginChild(("task_item_" + std::to_string(i)).c_str(), 
+                             ImVec2(ImGui::GetContentRegionAvail().x - buttons_width, item_height), 
+                             false);
+            if (ImGui::Selectable(("##task_sel_" + std::to_string(i)).c_str(), selected, 0, 
+                                 ImVec2(0, ImGui::GetTextLineHeight() * 2))) {
+              state.selected_task_index = i;
+              state.selected_run_index = -1;
+            }
+            ImGui::SameLine(0, 0);
+            ImGui::SetCursorPosX(5);
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 5);
+            ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x - 5);
+            ImGui::Text("%s", task_names[i].c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::EndChild();
+            
+            // Action buttons (positioned absolutely on the right)
+            ImGui::SameLine();
+            ImGui::SetCursorPosY(start_y + (item_height - ImGui::GetTextLineHeight()) * 0.5f);
+            if (ImGui::SmallButton((ICON_FA_FOLDER_OPEN "##open_task_" + std::to_string(i)).c_str())) {
+              OpenFolderExternal(task_dir);
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open folder");
+            
+            ImGui::SameLine();
+            ImGui::SetCursorPosY(start_y + (item_height - ImGui::GetTextLineHeight() - 2) * 0.5f);
+            {
+              ImGuiStyleColorScope _btn(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+              if (ImGui::SmallButton((ICON_FA_TRASH "##del_task_" + std::to_string(i)).c_str())) {
+                state.pending_delete_path = task_dir;
+                state.show_confirm_delete = true;
+              }
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete task folder");
+            
+            // Move to next line after buttons
+            ImGui::SetCursorPosY(start_y + item_height);
+          }
         }
         ImGui::EndChild();
         ImGui::SameLine();
 
-        // Middle: runs list for selected task
+        // Column 2: runs list (timestamps) with action buttons
         ImGui::BeginChild("logs_runs",
-                          ImVec2(ImGui::GetContentRegionAvail().x * 0.5f, 220),
+                          ImVec2(ImGui::GetContentRegionAvail().x * 0.30f, 220),
                           true);
         std::string selected_task_name;
+        int run_count = 0;
         int current_task_idx = 0;
         DIR *d2 = opendir(logs_root.c_str());
         if (d2) {
@@ -5330,19 +7107,70 @@ void RenderMainUI(AppState &state) {
           if (d3) {
             int idx = 0;
             struct dirent *e;
+            std::vector<std::string> run_names;
             while ((e = readdir(d3)) != NULL) {
               if (e->d_name[0] == '.')
                 continue;
               std::string run_dir = task_dir + "/" + e->d_name;
               if (!DirectoryExists(run_dir))
                 continue;
-              bool selected = (state.selected_run_index == idx);
-              if (ImGui::Selectable(e->d_name, selected)) {
-                state.selected_run_index = idx;
-              }
-              idx++;
+              run_names.push_back(e->d_name);
             }
             closedir(d3);
+            
+            for (size_t i = 0; i < run_names.size(); i++) {
+              bool selected = (state.selected_run_index == (int)i);
+              std::string run_dir = task_dir + "/" + run_names[i];
+              
+              float item_height = ImGui::GetTextLineHeight() * 2 + 5;
+              float start_y = ImGui::GetCursorPosY();
+              float button_size = ImGui::CalcTextSize(ICON_FA_FOLDER_OPEN).x + ImGui::GetStyle().FramePadding.x * 2;
+              float buttons_width = button_size * 2 + ImGui::GetStyle().ItemSpacing.x + 5;
+              
+              // Text with wrapping
+              ImGui::BeginChild(("run_item_" + std::to_string(i)).c_str(), 
+                               ImVec2(ImGui::GetContentRegionAvail().x - buttons_width, item_height), 
+                               false);
+              if (ImGui::Selectable(("##run_sel_" + std::to_string(i)).c_str(), selected, 0, 
+                                   ImVec2(0, ImGui::GetTextLineHeight() * 2))) {
+                state.selected_run_index = i;
+              }
+              ImGui::SameLine(0, 0);
+              ImGui::SetCursorPosX(5);
+              ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 5);
+              ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x - 5);
+              ImGui::Text("%s", run_names[i].c_str());
+              ImGui::PopTextWrapPos();
+              ImGui::EndChild();
+              
+              // Action buttons (positioned absolutely on the right)
+              ImGui::SameLine();
+              ImGui::SetCursorPosY(start_y + (item_height - ImGui::GetTextLineHeight()) * 0.5f);
+              if (ImGui::SmallButton((ICON_FA_FOLDER_OPEN "##open_run_" + std::to_string(i)).c_str())) {
+                OpenFolderExternal(run_dir);
+              }
+              if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open folder");
+              
+              ImGui::SameLine();
+              ImGui::SetCursorPosY(start_y + (item_height - ImGui::GetTextLineHeight()) * 0.5f);
+              {
+                ImGuiStyleColorScope _btn(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+                if (ImGui::SmallButton((ICON_FA_TRASH "##del_run_" + std::to_string(i)).c_str())) {
+                  state.pending_delete_path = run_dir;
+                  state.show_confirm_delete = true;
+                }
+              }
+              if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete run folder");
+              
+              // Move to next line after buttons
+              ImGui::SetCursorPosY(start_y + item_height);
+              
+              run_count++;
+            }
+            
+            if (run_count == 0) {
+              ImGui::TextDisabled("No logs available for this task");
+            }
           }
         } else {
           ImGui::TextDisabled("Select a task to see runs");
@@ -5350,8 +7178,9 @@ void RenderMainUI(AppState &state) {
         ImGui::EndChild();
         ImGui::SameLine();
 
-        // Right: actions for selected run
-        ImGui::BeginChild("logs_actions", ImVec2(0, 220), true);
+        // Column 3: subdirectories (audit/feedback/verify) with action buttons
+        ImGui::BeginChild("logs_subdirs", ImVec2(ImGui::GetContentRegionAvail().x * 0.28f, 220), true);
+        std::string run_dir_for_files;
         if (!selected_task_name.empty() && state.selected_run_index >= 0) {
           // Recompute selected run name
           std::string run_name;
@@ -5377,22 +7206,139 @@ void RenderMainUI(AppState &state) {
           std::string run_dir =
               run_name.empty() ? std::string() : (task_dir + "/" + run_name);
           if (!run_dir.empty()) {
-            ImGui::TextWrapped("%s", run_dir.c_str());
-            if (AnimatedButton("Open", ImVec2(0, 0), "open_folder")) {
-              OpenFolderExternal(run_dir);
-            }
-            ImGui::SameLine();
-            {
-              ImGuiStyleColorScope _btn(ImGuiCol_Button,
-                                        ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
-              if (AnimatedButton("Delete", ImVec2(0, 0), "delete_folder")) {
-                state.pending_delete_path = run_dir;
-                state.show_confirm_delete = true;
+            run_dir_for_files = run_dir;
+            
+            // List subdirectories (audit, feedback, verify)
+            DIR *d5 = opendir(run_dir.c_str());
+            if (d5) {
+              struct dirent *subdir_entry;
+              int subdir_count = 0;
+              while ((subdir_entry = readdir(d5)) != NULL) {
+                if (subdir_entry->d_name[0] == '.')
+                  continue;
+                std::string subdir_path = run_dir + "/" + subdir_entry->d_name;
+                if (!DirectoryExists(subdir_path))
+                  continue;
+                
+                ImGui::Text(ICON_FA_FOLDER " %s", subdir_entry->d_name);
+                ImGui::SameLine();
+                float x_pos = ImGui::GetContentRegionAvail().x - 85;
+                if (x_pos > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + x_pos);
+                
+                if (ImGui::SmallButton((ICON_FA_FOLDER_OPEN "##open_subdir_" + std::to_string(subdir_count)).c_str())) {
+                  OpenFolderExternal(subdir_path);
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open folder");
+                
+                ImGui::SameLine();
+                {
+                  ImGuiStyleColorScope _btn(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+                  if (ImGui::SmallButton((ICON_FA_TRASH "##del_subdir_" + std::to_string(subdir_count)).c_str())) {
+                    state.pending_delete_path = subdir_path;
+                    state.show_confirm_delete = true;
+                  }
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete folder");
+                
+                subdir_count++;
+              }
+              closedir(d5);
+              
+              if (subdir_count == 0) {
+                ImGui::TextDisabled("No subdirectories in this run");
               }
             }
           }
         } else {
-          ImGui::TextDisabled("Select a run to manage");
+          if (!selected_task_name.empty() && run_count == 0) {
+            ImGui::TextDisabled("No logs available");
+          } else if (!selected_task_name.empty()) {
+            ImGui::TextDisabled("Select a run");
+          } else {
+            ImGui::TextDisabled("Select a task and run");
+          }
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+
+        // Column 4: specific files list with actions
+        ImGui::BeginChild("logs_files", ImVec2(0, 220), true);
+        if (!run_dir_for_files.empty()) {
+          // List all files in subdirectories
+          DIR *d6 = opendir(run_dir_for_files.c_str());
+          if (d6) {
+            struct dirent *subdir_entry;
+            int file_total = 0;
+            while ((subdir_entry = readdir(d6)) != NULL) {
+              if (subdir_entry->d_name[0] == '.')
+                continue;
+              std::string subdir_path = run_dir_for_files + "/" + subdir_entry->d_name;
+              if (!DirectoryExists(subdir_path))
+                continue;
+              
+              // List files in this subdirectory
+              DIR *d7 = opendir(subdir_path.c_str());
+              if (d7) {
+                struct dirent *file_entry;
+                while ((file_entry = readdir(d7)) != NULL) {
+                  if (file_entry->d_name[0] == '.')
+                    continue;
+                  std::string file_path = subdir_path + "/" + file_entry->d_name;
+                  
+                  // Check if it's a file (not directory)
+                  struct stat file_stat;
+                  if (stat(file_path.c_str(), &file_stat) == 0 && S_ISREG(file_stat.st_mode)) {
+                    // Text with wrapping
+                    ImGui::BeginChild(("file_item_" + std::to_string(file_total)).c_str(), 
+                                     ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetTextLineHeight() + 5), 
+                                     false);
+                    ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x - 85);
+                    ImGui::Text(ICON_FA_FILE " %s", file_entry->d_name);
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndChild();
+                    
+                    ImGui::SameLine();
+                    float x_pos = ImGui::GetContentRegionAvail().x - 85;
+                    if (x_pos > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + x_pos);
+                    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - ImGui::GetTextLineHeight() - 2);
+                    
+                    if (ImGui::SmallButton((ICON_FA_ARROW_UP_RIGHT_FROM_SQUARE "##open_file_" + std::to_string(file_total)).c_str())) {
+                      OpenFolderExternal(file_path);
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open file");
+                    
+                    ImGui::SameLine();
+                    {
+                      ImGuiStyleColorScope _btn(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+                      if (ImGui::SmallButton((ICON_FA_TRASH "##del_file_" + std::to_string(file_total)).c_str())) {
+                        state.pending_delete_path = file_path;
+                        state.show_confirm_delete = true;
+                      }
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete file");
+                    
+                    file_total++;
+                  }
+                }
+                closedir(d7);
+              }
+            }
+            closedir(d6);
+            
+            if (file_total == 0) {
+              ImGui::TextDisabled("No files found in this run");
+            }
+          }
+        } else {
+          if (!selected_task_name.empty() && run_count == 0) {
+            ImGui::TextDisabled("No files to display");
+          } else if (!selected_task_name.empty() && state.selected_run_index >= 0) {
+            ImGui::TextDisabled("Loading files...");
+          } else if (!selected_task_name.empty()) {
+            ImGui::TextDisabled("Select a run to see files");
+          } else {
+            ImGui::TextDisabled("Select a task and run to see files");
+          }
         }
         ImGui::EndChild();
       } else {
@@ -5421,7 +7367,6 @@ void RenderMainUI(AppState &state) {
 
       // Confirmation modal moved to global scope (after TabBar)
 
-      } // end else (Docker is available)
       // _tab_manage RAII closes the tab
     }
   }
@@ -5728,8 +7673,13 @@ void RenderMainUI(AppState &state) {
     if (_tab_proc) {
       ImGui::Spacing();
 
-      // Get running task count
+      // Get running task count and total task count
       int running_count = GetRunningTaskCount(state);
+      int total_task_count = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.tasks_mutex);
+        total_task_count = state.tasks.size();
+      }
 
       ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), "Active Processes");
       ImGui::SameLine();
@@ -5738,8 +7688,8 @@ void RenderMainUI(AppState &state) {
 
       ImGui::Spacing();
 
-      // Control buttons
-      if (running_count > 0) {
+      // Control buttons - only show if there are tasks
+      if (total_task_count > 0 && running_count > 0) {
         // Check if any tasks are still creating containers
         int creating_containers = 0;
         int ready_to_stop = 0;
@@ -5798,9 +7748,6 @@ void RenderMainUI(AppState &state) {
             }
           }
         }
-      } else {
-        ImGuiDisabledScope _dis;
-        ImGui::Button("Stop All Tasks");
       }
 
       ImGui::Spacing();
@@ -5861,13 +7808,92 @@ void RenderMainUI(AppState &state) {
       }
     }
   }
-
-   // About tab
-   {
+  // Prompt Editor tab
+  {
+    ImGuiTabItemScope _tab_prompts("Prompt Editor");
+    if (_tab_prompts) {
+      ImGui::Spacing();
+      ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), "Customize Gemini Prompts");
+      ImGui::Spacing();
+      ImGui::Separator();
+      ImGui::Spacing();
+      
+      ImGui::Text("Edit the prompts used by the autobuild.sh script for Gemini CLI execution.");
+      ImGui::Text("These prompts are used in Feedback, Verify, and Audit modes.");
+      ImGui::Spacing();
+      
+      if (state.prompts_modified) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.0f, 1.0f));
+        ImGui::Text("Status: Prompts have been modified");
+        ImGui::PopStyleColor();
+      } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
+        ImGui::Text("Status: Using default prompts");
+        ImGui::PopStyleColor();
+      }
+      
+      ImGui::Spacing();
+      ImGui::Separator();
+      ImGui::Spacing();
+      
+      if (ImGui::Button("Open Prompt Editor", ImVec2(200, 40))) {
+        DevLog(state, "Main UI: Open Prompt Editor button clicked");
+        state.show_prompt_editor = true;
+      }
+      
+      ImGui::Spacing();
+      
+      // Help section for the prompt editor
+      if (ImGui::CollapsingHeader(ICON_FA_INFO " How to use the Prompt Editor")) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+        ImGui::Text(ICON_FA_CIRCLE " "); ImGui::SameLine(); ImGui::TextWrapped("Edit your prompts in the text areas within each tab");
+        ImGui::Text(ICON_FA_CIRCLE " "); ImGui::SameLine(); ImGui::TextWrapped("Changes are automatically saved to history when you finish editing (click away)");
+        ImGui::Text(ICON_FA_CIRCLE " "); ImGui::SameLine(); ImGui::TextWrapped("Use the undo/redo buttons (" ICON_FA_ROTATE_LEFT "/" ICON_FA_ROTATE_RIGHT ") in the diff view toolbar to navigate your edit history");
+        ImGui::Text(ICON_FA_CIRCLE " "); ImGui::SameLine(); ImGui::TextWrapped("Use the minus button (" ICON_FA_MINUS ") to clear current state (go back one step)");
+        ImGui::Text(ICON_FA_CIRCLE " "); ImGui::SameLine(); ImGui::TextWrapped("Use the trash button (" ICON_FA_TRASH ") to clear all history for one prompt (reset to original)");
+        ImGui::Text(ICON_FA_CIRCLE " "); ImGui::SameLine(); ImGui::TextWrapped("Use 'Clear All History' button to clear history for all prompts and reset all to original");
+        ImGui::Text(ICON_FA_CIRCLE " "); ImGui::SameLine(); ImGui::TextWrapped("The diff view shows changes compared to the original prompt");
+        ImGui::Text(ICON_FA_CIRCLE " "); ImGui::SameLine(); ImGui::TextWrapped("History persists between sessions - your undo/redo will be available when you restart");
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+      }
+      
+      ImGui::Spacing();
+      ImGui::Text("Available Prompts:");
+      ImGui::BulletText("Prompt 1 - Feedback mode initial prompt");
+      ImGui::BulletText("Prompt 2 - Feedback mode follow-up prompt");
+      ImGui::BulletText("Audit Prompt - Used in Audit mode");
+      
+      ImGui::Spacing();
+      ImGui::Separator();
+      ImGui::Spacing();
+      
+      std::string prompts_file = GetPromptsFilePath();
+      ImGui::Text("Prompts file location:");
+      ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", prompts_file.c_str());
+      
+      // Open/Copy buttons for prompts file
+      if (ImGui::Button("Open Folder")) {
+        std::string folder_path = prompts_file;
+        size_t last_slash = folder_path.find_last_of("/\\");
+        if (last_slash != std::string::npos) {
+          folder_path = folder_path.substr(0, last_slash);
+        }
+        OpenFolderExternal(folder_path);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Copy Path")) {
+        ImGui::SetClipboardText(prompts_file.c_str());
+      }
+    }
+  }
+  
+  // About tab
+  {
     ImGuiTabItemScope _tab_about("About");
     if (_tab_about) {
       ImGui::Spacing();
-      ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f),"Version: 2.0.0");
+      ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f),"Version: 2.0.1");
       ImGui::Text("Build: %s", __DATE__);
       ImGui::Spacing();
       ImGui::Separator();
@@ -5931,6 +7957,8 @@ void RenderMainUI(AppState &state) {
       // No manual EndTabItem() here; RAII handles it
     }
   }
+
+  
 
   // Global modals (render every frame regardless of active tab)
   // Image delete error display (using regular window to avoid assertions)
@@ -6047,6 +8075,88 @@ void RenderMainUI(AppState &state) {
     if (cancelled) {
       state.pending_delete_path.clear();
       state.show_confirm_delete = false;
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+  }
+
+
+  // Confirm clear all history modal
+  if (state.show_confirm_clear_all_history) {
+    ImGui::OpenPopup("Confirm Clear All History");
+    // Center the popup on screen
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  }
+  if (ImGui::BeginPopupModal("Confirm Clear All History", nullptr,
+                             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
+    ImGui::SetWindowSize(ImVec2(400, 0));
+    ImGui::TextWrapped("Clear history for ALL prompts?\nThis action cannot be undone.");
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    float button_width = 130.0f;
+    float spacing = 20.0f;
+    float total_width = button_width * 2 + spacing;
+    float available_width = ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX((available_width - total_width) * 0.7f);
+
+    {
+      ImGuiStyleColorScope _btn(ImGuiCol_Button,
+                                ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+      bool confirmed = AnimatedButton("Yes, Clear All", ImVec2(button_width, 0), "confirm_clear_all_history");
+      if (confirmed) {
+        ClearAllHistory(state);
+        state.show_confirm_clear_all_history = false;
+        ImGui::CloseCurrentPopup();
+      }
+    }
+    ImGui::SameLine();
+    bool cancelled = AnimatedButton("Cancel", ImVec2(button_width, 0), "cancel_clear_all_history");
+    if (cancelled) {
+      state.show_confirm_clear_all_history = false;
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+  }
+
+  // Confirm clear all history for one prompt modal
+  if (state.show_confirm_clear_prompt_all_history) {
+    ImGui::OpenPopup("Confirm Clear All Prompt History");
+    // Center the popup on screen
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  }
+  if (ImGui::BeginPopupModal("Confirm Clear All Prompt History", nullptr,
+                             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
+    ImGui::SetWindowSize(ImVec2(400, 0));
+    ImGui::TextWrapped("Clear ALL history for this prompt and reset to original?\nThis action cannot be undone.");
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    float button_width = 130.0f;
+    float spacing = 20.0f;
+    float total_width = button_width * 2 + spacing;
+    float available_width = ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX((available_width - total_width) * 0.7f);
+
+    {
+      ImGuiStyleColorScope _btn(ImGuiCol_Button,
+                                ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+      bool confirmed = AnimatedButton("Yes, Clear All", ImVec2(button_width, 0), "confirm_clear_prompt_all_history");
+      if (confirmed) {
+        ClearAllPromptHistory(state, state.pending_clear_prompt_index);
+        SavePrompts(state);
+        state.pending_clear_prompt_index = -1;
+        state.show_confirm_clear_prompt_all_history = false;
+        ImGui::CloseCurrentPopup();
+      }
+    }
+    ImGui::SameLine();
+    bool cancelled = AnimatedButton("Cancel", ImVec2(button_width, 0), "cancel_clear_prompt_all_history");
+    if (cancelled) {
+      state.pending_clear_prompt_index = -1;
+      state.show_confirm_clear_prompt_all_history = false;
       ImGui::CloseCurrentPopup();
     }
     ImGui::EndPopup();
@@ -6258,6 +8368,9 @@ void RenderMainUI(AppState &state) {
 
   // Pop window background color
   ImGui::PopStyleColor(1); // WindowBg
+  
+  // Render Prompt Editor window if open
+  RenderPromptEditor(state);
   
   // Render dev overlay last so it remains visible on top
   if (state.dev_mode) {
@@ -6518,6 +8631,9 @@ int main(int argc, char **argv) {
 
   // Load configuration from file
   LoadConfig(state);
+  
+  // Load prompts from file
+  LoadPrompts(state);
 
   // Main loop
   bool running = true;
@@ -6726,6 +8842,11 @@ int main(int argc, char **argv) {
   // Wait for command thread to finish if still running
   if (state.command_thread.joinable()) {
     state.command_thread.join();
+  }
+
+  // Wait for Docker refresh thread to finish if still running
+  if (state.docker_refresh_thread.joinable()) {
+    state.docker_refresh_thread.join();
   }
 
   // Cleanup

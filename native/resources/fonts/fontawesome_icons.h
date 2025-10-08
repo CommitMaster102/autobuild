@@ -32,12 +32,20 @@
 #define ICON_FA_CHEVRON_UP "\uf077"          // up
 #define ICON_FA_CHEVRON_DOWN "\uf078"        // down
 
+// Undo/Redo Icons
+#define ICON_FA_ROTATE_LEFT "\uf0e2"         // undo/rotate left
+#define ICON_FA_ROTATE_RIGHT "\uf01e"        // redo/rotate right
+#define ICON_FA_UNDO "\uf0e2"                // undo (alias)
+#define ICON_FA_REDO "\uf01e"                // redo (alias)
+
 // File/Folder Icons
 #define ICON_FA_FOLDER "\uf07b"              // folder
 #define ICON_FA_FOLDER_OPEN "\uf07c"         // open folder
 #define ICON_FA_FILE "\uf15b"                // file
 #define ICON_FA_FILE_TEXT "\uf15c"           // text file
 #define ICON_FA_FILE_CODE "\uf1c9"           // code file
+#define ICON_FA_FOLDER_TREE "\uf802"         // folder tree
+#define ICON_FA_ARROW_UP_RIGHT_FROM_SQUARE "\uf35d"  // open external
 
 // System Icons
 #define ICON_FA_REFRESH "\uf021"             // refresh/reload (original)

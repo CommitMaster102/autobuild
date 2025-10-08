@@ -17,10 +17,10 @@ die()      { log_error "$*"; exit 1; }
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") feedback --task <abs_task_dir> [--image-tag <tag>] [--container-name <name>] [--workdir <path>] [--api-key <key>] [--output-dir <dir>]
-  $(basename "$0") verify   --task <abs_task_dir> [--image-tag <tag>] [--container-name <name>] [--workdir <path>] [--api-key <key>] [--output-dir <dir>]
-  $(basename "$0") both     --task <abs_task_dir> [--image-tag <tag>] [--container-name <base>] [--workdir <path>] [--api-key <key>] [--output-dir <dir>]
-  $(basename "$0") audit    --task <abs_task_dir> [--image-tag <tag>] [--container-name <name>] [--workdir <path>] [--api-key <key>] [--output-dir <dir>]
+  $(basename "$0") feedback --task <abs_task_dir> [--image-tag <tag>] [--container-name <name>] [--workdir <path>] [--api-key <key>] [--output-dir <dir>] [--no-cache] [--debug]
+  $(basename "$0") verify   --task <abs_task_dir> [--image-tag <tag>] [--container-name <name>] [--workdir <path>] [--api-key <key>] [--output-dir <dir>] [--no-cache] [--debug]
+  $(basename "$0") both     --task <abs_task_dir> [--image-tag <tag>] [--container-name <base>] [--workdir <path>] [--api-key <key>] [--output-dir <dir>] [--no-cache] [--debug]
+  $(basename "$0") audit    --task <abs_task_dir> [--image-tag <tag>] [--container-name <name>] [--workdir <path>] [--api-key <key>] [--output-dir <dir>] [--no-cache] [--debug]
 Arguments:
   --task            Absolute path to task folder containing env/, verify/, prompt (file or directory)
   --image-tag       Docker image tag to build/use (default: autobuild-<task_name>:latest)
@@ -28,6 +28,8 @@ Arguments:
   --workdir         Container working directory override (default: parsed from Dockerfile or /workspace)
   --api-key         Gemini API key (default: from GEMINI_API_KEY env)
   --output-dir      Directory to save logs/prompts (default: <workspace>/feedback/<task_name>/<timestamp>)
+  --no-cache        Force Docker to rebuild without using cache
+  --debug           Enable verbose Docker build output with --progress=plain
 
 Notes:
   - feedback: Installs @google/gemini-cli@0.3.0-preview.1 in the container and runs Prompt 1;
@@ -201,48 +203,165 @@ copy_verify_to_container() {
   fi
 }
 
+read_prompt_from_json() {
+  local key="$1"; local default_value="$2"
+  local prompts_file=""
+  
+  # Check for prompts.json in multiple locations
+  if [ -f "$HOME/.config/autobuild/prompts.json" ]; then
+    prompts_file="$HOME/.config/autobuild/prompts.json"
+  elif [ -f "${LOCALAPPDATA:-}/Autobuild/prompts.json" ]; then
+    prompts_file="${LOCALAPPDATA}/Autobuild/prompts.json"
+  elif [ -f "prompts.json" ]; then
+    prompts_file="prompts.json"
+  elif [ -f "$(dirname "$0")/../../native/build/prompts.json" ]; then
+    prompts_file="$(dirname "$0")/../../native/build/prompts.json"
+  fi
+  
+  if [ -n "$prompts_file" ] && [ -f "$prompts_file" ]; then
+    # Read entire file and extract JSON value properly
+    local content
+    content=$(cat "$prompts_file")
+    
+    # Find the key and extract its value
+    # Pattern: "key": "value"
+    # We need to handle escaped quotes and newlines
+    local pattern="\"$key\": \""
+    
+    # Check if key exists in file
+    if echo "$content" | grep -q "\"$key\""; then
+      # Extract everything between "key": " and the next unescaped "
+      # Use Python if available for proper JSON parsing, otherwise use awk
+      if command -v python3 >/dev/null 2>&1; then
+        local extracted
+        extracted=$(python3 -c "
+import json
+import sys
+try:
+    with open('$prompts_file', 'r') as f:
+        data = json.load(f)
+        if '$key' in data:
+            print(data['$key'], end='')
+except:
+    pass
+" 2>/dev/null)
+        if [ -n "$extracted" ]; then
+          echo "$extracted"
+          return 0
+        fi
+      elif command -v python >/dev/null 2>&1; then
+        local extracted
+        extracted=$(python -c "
+import json
+import sys
+try:
+    with open('$prompts_file', 'r') as f:
+        data = json.load(f)
+        if '$key' in data:
+            print(data['$key'], end='')
+except:
+    pass
+" 2>/dev/null)
+        if [ -n "$extracted" ]; then
+          echo "$extracted"
+          return 0
+        fi
+      else
+        # Fallback: use awk for basic parsing (less reliable but no dependencies)
+        local extracted
+        extracted=$(awk -v key="$key" '
+          BEGIN { RS=""; FS=""; in_value=0; value=""; escaped=0; }
+          {
+            # Find the key
+            pattern = "\"" key "\": \""
+            idx = index($0, pattern)
+            if (idx > 0) {
+              # Start after the pattern
+              start = idx + length(pattern)
+              for (i = start; i <= length($0); i++) {
+                c = substr($0, i, 1)
+                if (escaped) {
+                  # Handle escape sequences
+                  if (c == "n") value = value "\n"
+                  else if (c == "t") value = value "\t"
+                  else if (c == "\"") value = value "\""
+                  else if (c == "\\") value = value "\\"
+                  else value = value c
+                  escaped = 0
+                } else if (c == "\\") {
+                  escaped = 1
+                } else if (c == "\"") {
+                  # End of value
+                  print value
+                  exit 0
+                } else {
+                  value = value c
+                }
+              }
+            }
+          }
+        ' "$prompts_file")
+        if [ -n "$extracted" ]; then
+          echo "$extracted"
+          return 0
+        fi
+      fi
+    fi
+  fi
+  
+  echo "$default_value"
+}
+
 compose_prompt1_file() {
   local src_prompt_file="$1"; local out_file="$2"
-  cat >"$out_file" <<'EOF'
-**Task:** 
+  
+  local default_prompt='**Task:** 
 
 1.  Read the user request from the `prompt` file and execute the specified tasks. 
 2.  Use the `verify.sh` script to test your solution. 
 
 **Analysis of `verify.sh`:** 
 
-Upon completion of the task, provide a concise analysis of the `verify.sh` script's effectiveness. Your summary should address the following: 
+Upon completion of the task, provide a concise analysis of the `verify.sh` script'\''s effectiveness. Your summary should address the following: 
 
 *   **Sufficiency:** Does the script contain adequate tests to confirm a successful task completion? 
-*   **Over-testing:** Does the script make rigid assumptions about the solution's implementation that might incorrectly fail a valid approach? 
+*   **Over-testing:** Does the script make rigid assumptions about the solution'\''s implementation that might incorrectly fail a valid approach? 
 *   **Scope:** Does the script test for requirements not explicitly stated in `prompt`? 
 
 ---
 Below is the content of prompt.txt for this task. Treat it as the user request:
----
-EOF
+---'
+  
+  local prompt_content
+  prompt_content=$(read_prompt_from_json "prompt1" "$default_prompt")
+  
+  echo "$prompt_content" >"$out_file"
   echo >>"$out_file"
   cat "$src_prompt_file" >>"$out_file"
 }
 
 compose_prompt2_file() {
   local out_file="$1"
-  cat >"$out_file" <<'EOF'
-**Hypothetical Scenario:** 
+  
+  local default_prompt='**Hypothetical Scenario:** 
 
 If the `verify.sh` script had not been provided, could you have successfully completed the task as defined in `prompt.txt`? 
 
 **Prompt and Verification Analysis:** 
 
-Identify any ambiguities or under-specified elements in either the `prompt.txt` or the `verify.sh` script that could have led to a failed test.
-EOF
+Identify any ambiguities or under-specified elements in either the `prompt.txt` or the `verify.sh` script that could have led to a failed test.'
+  
+  local prompt_content
+  prompt_content=$(read_prompt_from_json "prompt2" "$default_prompt")
+  
+  echo "$prompt_content" >"$out_file"
 }
 
 # --- build the Minimal Audit Prompt into a file
 compose_audit_prompt_file() {
   local out_file="$1"
-  cat >"$out_file" <<'EOF'
-# Minimal Audit Prompt (for Gemini CLI)
+  
+  local default_prompt='# Minimal Audit Prompt (for Gemini CLI)
 
 Context (read-only):
 - _context/prompt.txt   = task
@@ -270,8 +389,12 @@ Constraints:
 - Do NOT invent requirements beyond prompt.txt or implied by the Dockerfile.
 - Do NOT suggest modifying or implementing anything; audit only.
 - Do NOT modify _context/prompt.txt, _context/verify/*, or _context/Dockerfile.
-- Keep each reason to 1–2 sentences.
-EOF
+- Keep each reason to 1–2 sentences.'
+  
+  local prompt_content
+  prompt_content=$(read_prompt_from_json "audit_prompt" "$default_prompt")
+  
+  echo "$prompt_content" >"$out_file"
 }
 
 # --- copy prompt/verify/Dockerfile into WORKDIR/_context inside container
@@ -305,7 +428,7 @@ copy_context_into_container() {
 
 
 feedback() {
-  local task_dir="$1"; local image_tag="$2"; local container_name="$3"; local workdir="$4"; local gemini_api_key="$5"; local log_dir="$6"; local no_cache_flag="${7:-}"
+  local task_dir="$1"; local image_tag="$2"; local container_name="$3"; local workdir="$4"; local gemini_api_key="$5"; local log_dir="$6"; local no_cache_flag="${7:-}"; local debug_flag="${8:-}"
   local env_dir="$task_dir/env"
   local verify_dir_candidate="$task_dir/verify"
   local verify_file_candidate="$task_dir/command"
@@ -324,7 +447,7 @@ feedback() {
 
   mkdir -p "$log_dir"
 
-  build_image "$env_dir" "$image_tag" "$log_dir/docker_build.log" "$no_cache_flag"
+  build_image "$env_dir" "$image_tag" "$log_dir/docker_build.log" "$no_cache_flag" "$debug_flag"
   if [ -z "$workdir" ]; then workdir=$(parse_workdir_from_dockerfile "$env_dir"); log_info "Using WORKDIR from Dockerfile: $workdir"; fi
 
   run_container_keepalive "$image_tag" "$container_name"; ensure_container_running "$container_name"
@@ -379,7 +502,7 @@ feedback() {
 }
 
 verify() {
-  local task_dir="$1"; local image_tag="$2"; local container_name="$3"; local workdir="$4"; local gemini_api_key="$5"; local log_dir="$6"; local no_cache_flag="${7:-}"
+  local task_dir="$1"; local image_tag="$2"; local container_name="$3"; local workdir="$4"; local gemini_api_key="$5"; local log_dir="$6"; local no_cache_flag="${7:-}"; local debug_flag="${8:-}"
   local env_dir="$task_dir/env"
   local verify_dir_candidate="$task_dir/verify"
   local verify_file_candidate="$task_dir/command"
@@ -402,7 +525,7 @@ verify() {
   local prompt_raw; prompt_raw=$(cat "$prompt_path")
   printf '%s' "$prompt_raw" > "$log_dir/prompt_raw.txt"
 
-  build_image "$env_dir" "$image_tag" "$log_dir/docker_build.log" "$no_cache_flag"
+  build_image "$env_dir" "$image_tag" "$log_dir/docker_build.log" "$no_cache_flag" "$debug_flag"
   run_container_customer_exact "$image_tag" "$container_name"; ensure_container_running "$container_name"
 
   # Copy prompt to container to avoid path conversion issues with MSYS2
@@ -438,14 +561,14 @@ verify() {
 
 audit() {
   local task_dir="$1"; local image_tag="$2"; local container_name="$3"
-  local workdir="$4";  local gemini_api_key="$5"; local log_dir="$6"; local no_cache_flag="${7:-}"
+  local workdir="$4";  local gemini_api_key="$5"; local log_dir="$6"; local no_cache_flag="${7:-}"; local debug_flag="${8:-}"
   local env_dir="$task_dir/env"
 
   [ -d "$env_dir" ] || die "Missing env directory: $env_dir"
   mkdir -p "$log_dir"
 
   # Build image (adjust if your Dockerfile needs the task root as context)
-  build_image "$env_dir" "$image_tag" "$log_dir/docker_build.log" "$no_cache_flag"
+  build_image "$env_dir" "$image_tag" "$log_dir/docker_build.log" "$no_cache_flag" "$debug_flag"
   if [ -z "$workdir" ]; then
     workdir=$(parse_workdir_from_dockerfile "$env_dir")
     log_info "Using WORKDIR from Dockerfile: $workdir"
@@ -480,7 +603,7 @@ audit() {
 
 
 main() {
-  local mode="" task_dir="" image_tag="" container_name="" workdir="" api_key="${GEMINI_API_KEY:-}" output_dir="" no_cache=""
+  local mode="" task_dir="" image_tag="" container_name="" workdir="" api_key="${GEMINI_API_KEY:-}" output_dir="" no_cache="" debug_mode=""
   [ $# -ge 1 ] || { usage; exit 1; }
   mode="$1"; shift || true
   
@@ -495,6 +618,7 @@ main() {
       --api-key)         api_key="$2"; shift 2;;
       --output-dir)      output_dir="$2"; shift 2;;
       --no-cache)        no_cache="--no-cache"; shift 1;;
+      --debug)           debug_mode="--debug"; shift 1;;
       -h|--help)         usage; exit 0;;
       *)                 log_error "Unknown arg: $1"; usage; exit 1;;
     esac
@@ -521,20 +645,20 @@ main() {
     feedback)
       local cname_fb="${container_name}-feedback-${timestamp}"
       local out_fb="$output_dir/feedback"; mkdir -p "$out_fb"
-      feedback "$task_dir" "$image_tag" "$cname_fb" "$workdir" "$api_key" "$out_fb" "$no_cache"
+      feedback "$task_dir" "$image_tag" "$cname_fb" "$workdir" "$api_key" "$out_fb" "$no_cache" "$debug_mode"
       ;;
     verify)
       local cname_v="${container_name}-verify-${timestamp}"
       local out_v="$output_dir/verify"; mkdir -p "$out_v"
-      verify   "$task_dir" "$image_tag" "$cname_v" "$workdir" "$api_key" "$out_v" "$no_cache"
+      verify   "$task_dir" "$image_tag" "$cname_v" "$workdir" "$api_key" "$out_v" "$no_cache" "$debug_mode"
       ;;
     both)
       local out_fb="$output_dir/feedback"; mkdir -p "$out_fb"
       local out_v="$output_dir/verify"; mkdir -p "$out_v"
       local cname_fb="${container_name}-feedback-${timestamp}"
       local cname_v="${container_name}-verify-${timestamp}"
-      feedback "$task_dir" "$image_tag" "$cname_fb" "$workdir" "$api_key" "$out_fb" "$no_cache"
-      verify   "$task_dir" "$image_tag" "$cname_v" "$workdir" "$api_key" "$out_v" "$no_cache"
+      feedback "$task_dir" "$image_tag" "$cname_fb" "$workdir" "$api_key" "$out_fb" "$no_cache" "$debug_mode"
+      verify   "$task_dir" "$image_tag" "$cname_v" "$workdir" "$api_key" "$out_v" "$no_cache" "$debug_mode"
       ;;
     audit)
       local base="$(basename "$task_dir")"
@@ -548,7 +672,7 @@ main() {
         out="$base_logs_dir/$base/$timestamp/audit"
       fi
       mkdir -p "$out"
-      audit "$task_dir" "$img" "$cname" "$workdir" "$api_key" "$out" "$no_cache"
+      audit "$task_dir" "$img" "$cname" "$workdir" "$api_key" "$out" "$no_cache" "$debug_mode"
       ;;
     *)
       log_error "Unknown mode: $mode (valid modes: feedback, verify, both, audit)"; usage; exit 1;;

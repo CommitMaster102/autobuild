@@ -130,6 +130,16 @@ if(SDL2_FOUND)
         COMMENT "Linking OpenGL framework for autobuild_gui")
     endif()
 
+    # Create default prompts.json file if it doesn't exist
+    if(NOT EXISTS "${CMAKE_CURRENT_BINARY_DIR}/prompts.json")
+      file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/prompts.json" "{
+  \"prompt1\": \"**Task:** \\n\\n1.  Read the user request from the \\`prompt\\` file and execute the specified tasks. \\n2.  Use the \\`verify.sh\\` script to test your solution. \\n\\n**Analysis of \\`verify.sh\\`:** \\n\\nUpon completion of the task, provide a concise analysis of the \\`verify.sh\\` script's effectiveness. Your summary should address the following: \\n\\n*   **Sufficiency:** Does the script contain adequate tests to confirm a successful task completion? \\n*   **Over-testing:** Does the script make rigid assumptions about the solution's implementation that might incorrectly fail a valid approach? \\n*   **Scope:** Does the script test for requirements not explicitly stated in \\`prompt\\`? \\n\\n---\\nBelow is the content of prompt.txt for this task. Treat it as the user request:\\n---\",
+  \"prompt2\": \"**Hypothetical Scenario:** \\n\\nIf the \\`verify.sh\\` script had not been provided, could you have successfully completed the task as defined in \\`prompt.txt\\`? \\n\\n**Prompt and Verification Analysis:** \\n\\nIdentify any ambiguities or under-specified elements in either the \\`prompt.txt\\` or the \\`verify.sh\\` script that could have led to a failed test.\",
+  \"audit_prompt\": \"# Minimal Audit Prompt (for Gemini CLI)\\n\\nContext (read-only):\\n- _context/prompt.txt   = task\\n- _context/verify/      = verifier (entire folder)\\n- _context/Dockerfile   = environment contract (initial state)\\n\\nWorking environment:\\n- You are executing inside the environment created by the Dockerfile.\\n- All files/subfolders in the current working directory (except \\`_context/\\`) are the live environment.\\n- \\`_context/\\` is reference-only and read-only.\\n\\nTask:\\nAnalyze only. Determine if the verifier is valid for the task, if the task is clear enough to verify, and whether the verifier would also accept other valid implementations (within constraints). Do not implement or propose fixes.\\n\\nOutput in EXACTLY this format:\\n<VERIFY_VALID>Yes/No</VERIFY_VALID>\\n<VERIFY_REASON>[1–2 sentences. Explicitly address: behavior vs implementation, over-constraint vs prompt/Dockerfile invariants, environment/path assumptions, functional coverage, hardcoded/irrelevant data, and prompt–verify alignment.]</VERIFY_REASON>\\n<PROMPT_CLEAR>Yes/No</PROMPT_CLEAR>\\n<PROMPT_REASON>[1–2 sentences on whether the task is clear enough to verify and why.]</PROMPT_REASON>\\n<OTHER_VALID_SOLUTIONS_OK>Yes/No</OTHER_VALID_SOLUTIONS_OK>\\n<OTHER_SOLUTIONS_REASON>[1–2 sentences on whether the verifier would pass other valid solutions under the constraints and why.]</OTHER_SOLUTIONS_REASON>\\n\\nConstraints:\\n- Treat Dockerfile-defined paths, names, and platform as environment invariants (valid hardcoding).\\n- Do NOT invent requirements beyond prompt.txt or implied by the Dockerfile.\\n- Do NOT suggest modifying or implementing anything; audit only.\\n- Do NOT modify _context/prompt.txt, _context/verify/*, or _context/Dockerfile.\\n- Keep each reason to 1–2 sentences.\"
+}
+")
+    endif()
+
     # Copy Font Awesome fonts to build directory for main GUI
     if(EXISTS "${FONTS_DIR}/fa-solid-900.ttf")
       add_custom_command(TARGET autobuild_main POST_BUILD
@@ -369,6 +379,7 @@ install(DIRECTORY
 install(FILES 
   "${CMAKE_CURRENT_BINARY_DIR}/autobuild_gui.json"
   "${CMAKE_CURRENT_BINARY_DIR}/imgui.ini"
+  "${CMAKE_CURRENT_BINARY_DIR}/prompts.json"
   DESTINATION ${CMAKE_INSTALL_BINDIR}
   OPTIONAL)
 
