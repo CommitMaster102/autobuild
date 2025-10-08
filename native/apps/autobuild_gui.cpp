@@ -7893,7 +7893,6 @@ void RenderMainUI(AppState &state) {
     ImGuiTabItemScope _tab_about("About");
     if (_tab_about) {
       ImGui::Spacing();
-      ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f),"Version: 2.0.1");
       ImGui::Text("Build: %s", __DATE__);
       ImGui::Spacing();
       ImGui::Separator();
