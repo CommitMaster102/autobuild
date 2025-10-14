@@ -96,6 +96,18 @@ if(SDL2_FOUND)
           "$<TARGET_BUNDLE_DIR:autobuild_gui>/Contents/Frameworks/"
           COMMENT "Bundling SDL2 with autobuild_gui app")
         
+        # Copy shader files to app bundle Resources
+        add_custom_command(TARGET autobuild_gui POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E make_directory
+          "$<TARGET_BUNDLE_DIR:autobuild_gui>/Contents/Resources"
+          COMMAND ${CMAKE_COMMAND} -E copy
+          "${CMAKE_CURRENT_SOURCE_DIR}/apps/vertex.glsl"
+          "$<TARGET_BUNDLE_DIR:autobuild_gui>/Contents/Resources/"
+          COMMAND ${CMAKE_COMMAND} -E copy
+          "${CMAKE_CURRENT_SOURCE_DIR}/apps/fragment.glsl"
+          "$<TARGET_BUNDLE_DIR:autobuild_gui>/Contents/Resources/"
+          COMMENT "Bundling shader files with autobuild_gui app")
+        
         add_custom_command(TARGET autobuild_main POST_BUILD
           COMMAND ${CMAKE_COMMAND} -E make_directory
           "$<TARGET_BUNDLE_DIR:autobuild_main>/Contents/Frameworks"
